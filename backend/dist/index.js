@@ -37,21 +37,23 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const http_1 = __importDefault(require("http"));
+const path_1 = __importDefault(require("path"));
+const express_1 = __importDefault(require("express"));
 const ws_1 = require("ws");
 const ArbitrageEngine_1 = require("./ArbitrageEngine");
 const dotenv = __importStar(require("dotenv"));
 dotenv.config();
-const port = process.env.PORT || 8080;
-const server = http_1.default.createServer((req, res) => {
-    if (req.url === '/status') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(engine.getStatus()));
-    }
-    else {
-        res.writeHead(404);
-        res.end();
-    }
+const app = (0, express_1.default)();
+const port = process.env.PORT || 7860; // Hugging Face default port
+// Serve static frontend files from the 'frontend/dist' directory
+const frontendPath = path_1.default.join(__dirname, '../../frontend/dist');
+app.use(express_1.default.static(frontendPath));
+// Handle React routing (send all other requests to index.html)
+app.get('*', (req, res) => {
+    res.sendFile(path_1.default.join(frontendPath, 'index.html'));
 });
+const server = http_1.default.createServer(app);
+// Use a separate endpoint or just share the server for WebSockets
 const wss = new ws_1.WebSocketServer({ server });
 const engine = new ArbitrageEngine_1.ArbitrageEngine();
 wss.on('connection', (ws) => {
@@ -59,6 +61,6 @@ wss.on('connection', (ws) => {
     engine.handleClient(ws);
 });
 server.listen(port, () => {
-    console.log(`Arbitrage Backend running on http://localhost:${port}`);
-    console.log(`WebSocket server active on ws://localhost:${port}`);
+    console.log(`Arbitrage Dashboard running on http://localhost:${port}`);
+    console.log(`WebSocket server active on the same port`);
 });
