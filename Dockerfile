@@ -23,8 +23,8 @@ COPY --from=backend-builder /app/backend/package*.json ./backend/
 WORKDIR /app/backend
 RUN npm install --omit=dev
 
-EXPOSE 7860
-ENV PORT=7860
+EXPOSE 8080
+ENV PORT=8080
 ENV NODE_ENV=production
 
 CMD ["node", "dist/index.js"]
