@@ -1,7 +1,7 @@
 import http from 'http';
 import path from 'path';
-import express from 'express';
-import { WebSocketServer } from 'ws';
+import express, { Request, Response } from 'express';
+import WebSocket, { WebSocketServer } from 'ws';
 import { ArbitrageEngine } from './ArbitrageEngine';
 import * as dotenv from 'dotenv';
 
@@ -15,7 +15,7 @@ const frontendPath = path.join(__dirname, '../../frontend/dist');
 app.use(express.static(frontendPath));
 
 // Handle React routing (send all other requests to index.html)
-app.get('*', (req, res) => {
+app.get('*', (req: Request, res: Response) => {
   res.sendFile(path.join(frontendPath, 'index.html'));
 });
 
@@ -25,7 +25,7 @@ const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 const engine = new ArbitrageEngine();
 
-wss.on('connection', (ws: any) => {
+wss.on('connection', (ws: WebSocket) => {
   console.log('New client connected');
   engine.handleClient(ws);
 });
