@@ -1,3 +1,12 @@
+---
+title: Crypto Arb Bot
+emoji: 📈
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_port: 7860
+---
+
 # Crypto Options Arbitrage App
 
 A real-time arbitrage detection dashboard for BTC and ETH options across Deribit and Binance, powered by Cloudflare Workers and a premium React dashboard.
