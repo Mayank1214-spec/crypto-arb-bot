@@ -40,6 +40,7 @@ export class ArbitrageEngine {
     "wss://vstream.binance.com/ws"
   ];
   private currentBinanceUrlIndex: number = 0;
+  private binancePollInterval: NodeJS.Timeout | null = null;
 
   constructor() {
     this.startExchangeConnections();
@@ -181,12 +182,44 @@ export class ArbitrageEngine {
     ws.on('close', (code, reason) => {
       console.log(`Binance connection closed (Code: ${code}). Reason: ${reason}`);
       
-      // Rotate to next URL if we get a 404 or unexpected response
+      // If we've tried all URLs and none work, switch to REST polling
+      if (this.currentBinanceUrlIndex === this.binanceUrls.length - 1 && !this.binancePollInterval) {
+        console.log("⚠️ All Binance WebSocket endpoints blocked. Switching to REST Polling Fallback...");
+        this.startBinanceRestPolling();
+      }
+
       this.currentBinanceUrlIndex = (this.currentBinanceUrlIndex + 1) % this.binanceUrls.length;
       
       console.log(`Retrying next Binance endpoint in 5s...`);
       setTimeout(() => this.connectBinance(), 5000);
     });
+  }
+
+  private startBinanceRestPolling() {
+    if (this.binancePollInterval) return;
+    
+    // Initial poll
+    this.pollBinanceRest();
+    
+    // Poll every 2 seconds (safe rate limit for Binance)
+    this.binancePollInterval = setInterval(() => {
+      this.pollBinanceRest();
+    }, 2000);
+  }
+
+  private async pollBinanceRest() {
+    try {
+      // Using global fetch (available in Node 18+)
+      const response = await fetch("https://eapi.binance.com/eapi/v1/ticker");
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      
+      const data = await response.json();
+      if (Array.isArray(data)) {
+        data.forEach(item => this.updatePrice("Binance", item));
+      }
+    } catch (e: any) {
+      console.error(`Binance REST Poll Error: ${e.message}`);
+    }
   }
 
   private updatePrice(exchange: string, rawData: any) {
