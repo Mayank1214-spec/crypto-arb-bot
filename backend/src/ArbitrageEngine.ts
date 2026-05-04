@@ -34,6 +34,12 @@ export class ArbitrageEngine {
   private prices: Map<string, PriceData[]> = new Map();
   private clients: Set<WebSocket> = new Set();
   private lastUpdate = 0;
+  private binanceUrls: string[] = [
+    "wss://nbstream.binance.com/eoptions/ws",
+    "wss://vstream.binance.com/vstream",
+    "wss://vstream.binance.com/ws"
+  ];
+  private currentBinanceUrlIndex: number = 0;
 
   constructor() {
     this.startExchangeConnections();
@@ -122,12 +128,15 @@ export class ArbitrageEngine {
   }
 
   private connectBinance() {
-    // Use the base options endpoint
-    const ws = new WebSocket("wss://nbstream.binance.com/eoptions/ws");
+    const url = this.binanceUrls[this.currentBinanceUrlIndex];
+    console.log(`Attempting Binance connection via: ${url}`);
+    const ws = new WebSocket(url);
     
     ws.on('open', () => {
-      console.log("Connected to Binance Options");
-      // Explicitly subscribe to all tickers
+      console.log(`Connected to Binance Options via ${url}`);
+      // Reset index on success
+      this.currentBinanceUrlIndex = 0;
+
       const subscribeMsg = {
         method: "SUBSCRIBE",
         params: ["all@ticker"],
@@ -135,10 +144,9 @@ export class ArbitrageEngine {
       };
       ws.send(JSON.stringify(subscribeMsg));
 
-      // Start Heartbeat
       const heartbeat = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) {
-          ws.ping(); // Standard WS ping
+          ws.ping();
         } else {
           clearInterval(heartbeat);
         }
@@ -148,8 +156,6 @@ export class ArbitrageEngine {
     ws.on('message', (data: WebSocket.Data) => {
       try {
         const response = JSON.parse(data.toString());
-        
-        // Handle subscription confirmation
         if (response.result === null && response.id === 1) {
           console.log("Binance subscription successful");
           return;
@@ -158,23 +164,27 @@ export class ArbitrageEngine {
         if (Array.isArray(response)) {
           response.forEach(item => this.updatePrice("Binance", item));
         } else if (response.data) {
-          // Combined stream format
-          if (Array.isArray(response.data)) {
-             response.data.forEach((item: any) => this.updatePrice("Binance", item));
-          } else {
-             this.updatePrice("Binance", response.data);
-          }
+          const payload = Array.isArray(response.data) ? response.data : [response.data];
+          payload.forEach((item: any) => this.updatePrice("Binance", item));
         } else {
           this.updatePrice("Binance", response);
         }
       } catch (e) {
-        console.error('Error processing Binance message:', e);
+        // Silently skip non-JSON or heartbeat responses
       }
     });
 
-    ws.on('error', (err: Error) => console.error('Binance WS Error:', err));
-    ws.on('close', () => {
-      console.log('Binance connection closed. Reconnecting in 5s...');
+    ws.on('error', (err: any) => {
+      console.error(`Binance WS Error (${url}):`, err.message || err);
+    });
+
+    ws.on('close', (code, reason) => {
+      console.log(`Binance connection closed (Code: ${code}). Reason: ${reason}`);
+      
+      // Rotate to next URL if we get a 404 or unexpected response
+      this.currentBinanceUrlIndex = (this.currentBinanceUrlIndex + 1) % this.binanceUrls.length;
+      
+      console.log(`Retrying next Binance endpoint in 5s...`);
       setTimeout(() => this.connectBinance(), 5000);
     });
   }
