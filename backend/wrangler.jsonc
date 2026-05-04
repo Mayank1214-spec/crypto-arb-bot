@@ -1,0 +1,23 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "crypto-arb-backend",
+  "main": "src/index.ts",
+  "compatibility_date": "2024-04-01",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ARBITRAGE_ENGINE",
+        "class_name": "ArbitrageEngine"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_classes": ["ArbitrageEngine"]
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}
