@@ -78,13 +78,29 @@ export class ArbitrageEngine {
         id: 1,
         method: "public/subscribe",
         params: {
-          channels: [
-            "ticker.btc_usd.raw",
-            "ticker.eth_usd.raw"
-          ]
+          channels: ["ticker.BTC-27JUN25-100000-C.100ms", "ticker.ETH-27JUN25-2000-C.100ms"] // We will add logic to dynamic subscribe later
         }
       };
-      ws.send(JSON.stringify(subscribeMsg));
+      // For now, let's subscribe to all tickers if possible, or just the main ones
+      // Deribit doesn't have an "all" channel, we usually subscribe to instrument groups
+      const subAll = {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "public/subscribe",
+        params: {
+          channels: ["ticker.BTC-ANY.100ms", "ticker.ETH-ANY.100ms"]
+        }
+      };
+      ws.send(JSON.stringify(subAll));
+
+      // Start Heartbeat
+      const heartbeat = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ jsonrpc: "2.0", method: "public/test", params: {}, id: 999 }));
+        } else {
+          clearInterval(heartbeat);
+        }
+      }, 30000);
     });
 
     ws.on('message', (data: WebSocket.Data) => {
@@ -106,17 +122,48 @@ export class ArbitrageEngine {
   }
 
   private connectBinance() {
-    const ws = new WebSocket("wss://nbstream.binance.com/eoptions/ws/all@ticker");
+    // Use the base options endpoint
+    const ws = new WebSocket("wss://nbstream.binance.com/eoptions/ws");
     
     ws.on('open', () => {
       console.log("Connected to Binance Options");
+      // Explicitly subscribe to all tickers
+      const subscribeMsg = {
+        method: "SUBSCRIBE",
+        params: ["all@ticker"],
+        id: 1
+      };
+      ws.send(JSON.stringify(subscribeMsg));
+
+      // Start Heartbeat
+      const heartbeat = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.ping(); // Standard WS ping
+        } else {
+          clearInterval(heartbeat);
+        }
+      }, 30000);
     });
 
     ws.on('message', (data: WebSocket.Data) => {
       try {
         const response = JSON.parse(data.toString());
+        
+        // Handle subscription confirmation
+        if (response.result === null && response.id === 1) {
+          console.log("Binance subscription successful");
+          return;
+        }
+
         if (Array.isArray(response)) {
           response.forEach(item => this.updatePrice("Binance", item));
+        } else if (response.data) {
+          // Combined stream format
+          if (Array.isArray(response.data)) {
+             response.data.forEach((item: any) => this.updatePrice("Binance", item));
+          } else {
+             this.updatePrice("Binance", response.data);
+          }
         } else {
           this.updatePrice("Binance", response);
         }
