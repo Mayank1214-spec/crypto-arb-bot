@@ -62,7 +62,13 @@ export class ArbitrageEngine {
   // Configuration
   private dryRun = process.env.DRY_RUN !== 'false'; // Default to true for safety
   private minProfitThreshold = -100.0; // Show EVERYTHING for debugging
-  private maxPositionSize = 0.1; // 0.1 BTC or 1 ETH max per leg
+  private maxPositionSize = 10.0; // Increased for testing (10 BTC / 100 ETH)
+  private maxUsdPerTrade = 100000; // $100k cap for simulation
+  
+  private balances = {
+    'Deribit': 100.0, // BTC
+    'Bybit': 1000000.0 // USDT
+  };
 
   constructor() {
     console.log(`[ENGINE] Starting in ${this.dryRun ? 'DRY RUN' : 'LIVE'} mode`);
@@ -447,7 +453,18 @@ export class ArbitrageEngine {
     const existing = this.trades.find(t => t.opportunity.contract.asset === asset && t.status === 'OPEN');
     if (existing) return;
 
-    console.log(`[EXECUTION] Attempting trade for ${asset}...`);
+    // Calculate cost in USD
+    const costUsd = opportunity.buyPrice * opportunity.tradableSize;
+    
+    // Simple balance check for simulation
+    if (this.dryRun) {
+      if (opportunity.buyExchange === 'Bybit' && this.balances.Bybit < costUsd) {
+        console.log(`[DRY RUN] Insufficient Bybit balance for ${asset} ($${costUsd.toFixed(2)} > $${this.balances.Bybit.toFixed(2)})`);
+        return;
+      }
+    }
+
+    console.log(`[EXECUTION] Attempting trade for ${asset} | Size: ${opportunity.tradableSize} | Cost: $${costUsd.toFixed(2)}`);
     
     const trade: TradeRecord = {
       id: Date.now().toString(),
