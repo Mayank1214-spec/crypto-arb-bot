@@ -24,30 +24,53 @@ const App: React.FC = () => {
   const [opportunities, setOpportunities] = useState<Opportunity[]>([]);
   const [isConnected, setIsConnected] = useState(false);
   const [stats, setStats] = useState({ totalProfit: 0, scanCount: 0 });
+  const [priceCount, setPriceCount] = useState(0);
+  const [matchedPairs, setMatchedPairs] = useState(0);
+  const [tickers, setTickers] = useState<any[]>([]);
   const ws = useRef<WebSocket | null>(null);
 
   useEffect(() => {
     // Connect to the Cloudflare Worker WebSocket
     // In production, this would be the actual worker URL
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}`; 
+    const wsUrl = window.location.port === '5173' 
+      ? 'ws://localhost:7860' 
+      : `${protocol}//${window.location.host}`; 
     ws.current = new WebSocket(wsUrl);
 
     ws.current.onopen = () => setIsConnected(true);
     ws.current.onclose = () => setIsConnected(false);
     ws.current.onmessage = (event) => {
-      const message = JSON.parse(event.data);
-      if (message.type === 'OPPORTUNITY') {
-        const newOpp = message.data;
-        setOpportunities(prev => {
-          const contractKey = `${newOpp.contract.asset}_${newOpp.contract.expiry}_${newOpp.contract.strike}`;
-          const filtered = prev.filter(o => `${o.contract.asset}_${o.contract.expiry}_${o.contract.strike}` !== contractKey);
-          return [newOpp, ...filtered].slice(0, 10);
-        });
-        setStats(prev => ({ 
-          totalProfit: prev.totalProfit + newOpp.profitPercent, 
-          scanCount: prev.scanCount + 1 
-        }));
+      try {
+        const message = JSON.parse(event.data);
+        if (message.type === 'OPPORTUNITY') {
+          const newOpp = message.data;
+          setOpportunities(prev => {
+            const contractKey = `${newOpp.contract.asset}_${newOpp.contract.expiry}_${newOpp.contract.strike}`;
+            const filtered = prev.filter(o => `${o.contract.asset}_${o.contract.expiry}_${o.contract.strike}` !== contractKey);
+            return [newOpp, ...filtered].slice(0, 10);
+          });
+          setStats(prev => ({ 
+            totalProfit: prev.totalProfit + newOpp.profitPercent, 
+            scanCount: prev.scanCount + 1 
+          }));
+        } else if (message.type === 'STATUS') {
+          setPriceCount(message.data.priceCount);
+          setMatchedPairs(message.data.matchedPairs);
+        } else if (message.type === 'TICKER' && message.data?.contract) {
+          setTickers(prev => {
+            try {
+              const key = `${message.data.contract.asset}_${message.data.contract.expiry}_${message.data.contract.strike}_${message.data.contract.type}`;
+              const filtered = prev.filter(t => t?.contract && `${t.contract.asset}_${t.contract.expiry}_${t.contract.strike}_${t.contract.type}` !== key);
+              return [message.data, ...filtered].slice(0, 10);
+            } catch (e) {
+              console.error("Ticker processing error:", e);
+              return prev;
+            }
+          });
+        }
+      } catch (e) {
+        console.error("Message parsing error:", e);
       }
     };
 
@@ -86,11 +109,11 @@ const App: React.FC = () => {
             className="glass-card stat-card"
           >
             <div className="flex justify-between items-start">
-              <span className="stat-label">Total Opportunities</span>
+              <span className="stat-label">Matching Pairs</span>
               <Activity className="text-blue-400" size={20} />
             </div>
-            <div className="stat-value">{stats.scanCount}</div>
-            <p className="text-xs text-gray-400 mt-2">+12% from last hour</p>
+            <div className="stat-value">{matchedPairs}</div>
+            <p className="text-xs text-gray-400 mt-2">Scanning {priceCount} total prices</p>
           </motion.div>
 
           <motion.div 
@@ -117,8 +140,8 @@ const App: React.FC = () => {
               <span className="stat-label">Latency</span>
               <Clock className="text-amber-400" size={20} />
             </div>
-            <div className="stat-value">Node.js</div>
-            <p className="text-xs text-gray-400 mt-2">Oracle Cloud (Standalone)</p>
+            <div className="stat-value">{priceCount}</div>
+            <p className="text-xs text-gray-400 mt-2">Active Market Prices</p>
           </motion.div>
         </div>
 
@@ -201,6 +224,51 @@ const App: React.FC = () => {
                     ))
                   )}
                 </AnimatePresence>
+              </tbody>
+            </table>
+          </div>
+        </section>
+        {/* Live Market Feed */}
+        <section className="glass-card overflow-hidden">
+          <div className="p-6 border-b border-white/10">
+            <h2 className="text-lg font-semibold flex items-center gap-2">
+              <Activity size={20} className="text-emerald-400" />
+              Live Market Spreads (Deribit vs Bybit)
+            </h2>
+          </div>
+          <div className="p-6 overflow-x-auto">
+            <table className="arbitrage-table">
+              <thead>
+                <tr>
+                  <th>Instrument</th>
+                  <th>Bid (Buy Price)</th>
+                  <th>Ask (Sell Price)</th>
+                  <th>Spread %</th>
+                </tr>
+              </thead>
+              <tbody>
+                {tickers.length === 0 ? (
+                  <tr><td colSpan={4} className="text-center py-4 text-gray-500">Connecting to data feeds...</td></tr>
+                ) : (
+                  tickers.map((t, i) => (
+                    <tr key={i}>
+                      <td className="font-mono text-xs">
+                        {t?.contract?.asset}-{t?.contract?.expiry}-{t?.contract?.strike}-{t?.contract?.type}
+                      </td>
+                      <td>
+                        <span className="text-xs text-gray-500 mr-2">{t?.bidExchange}</span>
+                        <span className="font-mono text-emerald-400">${t?.bid?.toFixed(2)}</span>
+                      </td>
+                      <td>
+                        <span className="text-xs text-gray-500 mr-2">{t?.askExchange}</span>
+                        <span className="font-mono text-blue-400">${t?.ask?.toFixed(2)}</span>
+                      </td>
+                      <td className={(t?.spreadPercent || 0) > 0 ? 'text-emerald-400' : 'text-red-400'}>
+                        {t?.spreadPercent?.toFixed(3)}%
+                      </td>
+                    </tr>
+                  ))
+                )}
               </tbody>
             </table>
           </div>
