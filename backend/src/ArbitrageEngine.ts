@@ -61,7 +61,7 @@ export class ArbitrageEngine {
 
   // Configuration
   private dryRun = process.env.DRY_RUN !== 'false'; // Default to true for safety
-  private minProfitThreshold = 0.5; // 0.5% min profit to execute
+  private minProfitThreshold = 0.1; // 0.1% min profit to execute for testing
   private maxPositionSize = 0.1; // 0.1 BTC or 1 ETH max per leg
 
   constructor() {
