@@ -453,14 +453,27 @@ export class ArbitrageEngine {
     const existing = this.trades.find(t => t.opportunity.contract.asset === asset && t.status === 'OPEN');
     if (existing) return;
 
-    // Calculate cost in USD
-    const costUsd = opportunity.buyPrice * opportunity.tradableSize;
-    
     // Simple balance check for simulation
     if (this.dryRun) {
-      if (opportunity.buyExchange === 'Bybit' && this.balances.Bybit < costUsd) {
-        console.log(`[DRY RUN] Insufficient Bybit balance for ${asset} ($${costUsd.toFixed(2)} > $${this.balances.Bybit.toFixed(2)})`);
-        return;
+      if (opportunity.buyExchange === 'Bybit') {
+        if (this.balances.Bybit < costUsd) {
+          console.log(`[DRY RUN] Insufficient Bybit balance for ${asset} ($${costUsd.toFixed(2)} > $${this.balances.Bybit.toFixed(2)})`);
+          return;
+        }
+      } else if (opportunity.buyExchange === 'Deribit') {
+        if (this.balances.Deribit < opportunity.tradableSize) {
+          console.log(`[DRY RUN] Insufficient Deribit balance for ${asset} (${opportunity.tradableSize} > ${this.balances.Deribit})`);
+          return;
+        }
+      }
+    }
+
+    // Deduct balance for simulation
+    if (this.dryRun) {
+      if (opportunity.buyExchange === 'Bybit') {
+        this.balances.Bybit -= costUsd;
+      } else {
+        this.balances.Deribit -= opportunity.tradableSize;
       }
     }
 
@@ -525,6 +538,19 @@ export class ArbitrageEngine {
     console.log(`[EXECUTION] Closing trade ${trade.id} | Realized Profit: $${profit.toFixed(2)}`);
     trade.status = 'CLOSED';
     trade.profitActual = profit;
+
+    if (this.dryRun) {
+      // Credit back original simulation cost + profit
+      if (trade.opportunity.buyExchange === 'Bybit') {
+        this.balances.Bybit += (trade.opportunity.buyPrice * trade.opportunity.tradableSize) + profit;
+      } else {
+        // Approximate BTC/ETH profit
+        const asset = trade.opportunity.contract.asset;
+        const underlyingPrice = trade.opportunity.buyUnderlying;
+        this.balances.Deribit += trade.opportunity.tradableSize + (profit / underlyingPrice);
+      }
+    }
+
     this.broadcast({ type: "TRADE_EXECUTED", data: trade }); // Update status in Flutter
   }
 
