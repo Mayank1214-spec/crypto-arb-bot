@@ -61,7 +61,7 @@ export class ArbitrageEngine {
 
   // Configuration
   private dryRun = process.env.DRY_RUN !== 'false'; // Default to true for safety
-  private minProfitThreshold = 0.1; // 0.1% min profit to execute for testing
+  private minProfitThreshold = -100.0; // Show EVERYTHING for debugging
   private maxPositionSize = 0.1; // 0.1 BTC or 1 ETH max per leg
 
   constructor() {
@@ -89,7 +89,9 @@ export class ArbitrageEngine {
           bybitCount,
           matchedPairs,
           lastUpdate: this.lastUpdate,
-          exchanges: ["Deribit", "Bybit"]
+          exchanges: ["Deribit", "Bybit"],
+          deribitSymbols: deribitCount,
+          bybitSymbols: bybitCount
         }
       });
     }, 5000);
