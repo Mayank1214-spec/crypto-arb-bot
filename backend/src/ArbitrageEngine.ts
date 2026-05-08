@@ -453,6 +453,8 @@ export class ArbitrageEngine {
     const existing = this.trades.find(t => t.opportunity.contract.asset === asset && t.status === 'OPEN');
     if (existing) return;
 
+    const costUsd = opportunity.buyPrice * opportunity.tradableSize;
+
     // Simple balance check for simulation
     if (this.dryRun) {
       if (opportunity.buyExchange === 'Bybit') {
