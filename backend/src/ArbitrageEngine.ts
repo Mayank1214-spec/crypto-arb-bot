@@ -305,9 +305,10 @@ export class ArbitrageEngine {
       entries = entries.filter(e => e.exchange !== exchange);
       entries.push(price);
       this.prices.set(normalizedKey, entries);
-
       this.lastUpdate = Date.now();
+      
       this.checkArbitrage(normalizedKey, contract, entries);
+      this.monitorOpenTrades(normalizedKey, price);
     } catch (e) {
       console.error(`[updatePrice] Error processing ${exchange} data:`, e);
     }
@@ -442,11 +443,11 @@ export class ArbitrageEngine {
   }
 
   private async attemptExecution(opportunity: Opportunity) {
-    // Check if we already have an open trade for this symbol to avoid double entry
-    const existing = this.trades.find(t => t.opportunity.contract.asset === opportunity.contract.asset && t.status === 'OPEN');
+    const asset = opportunity.contract.asset;
+    const existing = this.trades.find(t => t.opportunity.contract.asset === asset && t.status === 'OPEN');
     if (existing) return;
 
-    console.log(`[EXECUTION] Attempting trade for ${opportunity.contract.asset}...`);
+    console.log(`[EXECUTION] Attempting trade for ${asset}...`);
     
     const trade: TradeRecord = {
       id: Date.now().toString(),
@@ -455,23 +456,59 @@ export class ArbitrageEngine {
       status: 'OPEN'
     };
 
-    if (this.dryRun) {
-      console.log(`[DRY RUN] Executed simulated trade for ${opportunity.contract.asset} @ ${opportunity.profitPercent.toFixed(2)}% profit`);
-      this.trades.push(trade);
-      this.broadcast({ type: "TRADE_EXECUTED", data: trade });
-      return;
-    }
+    this.trades.push(trade);
+    this.broadcast({ type: "TRADE_EXECUTED", data: trade });
 
-    // TODO: Implement Real Execution Logic with API Keys
-    try {
-      // 1. Place Buy Order
-      // 2. Place Sell Order
-      // 3. Update trade status
-      this.trades.push(trade);
-      this.broadcast({ type: "TRADE_EXECUTED", data: trade });
-    } catch (e) {
-      console.error("[EXECUTION ERROR]", e);
+    if (this.dryRun) {
+      console.log(`[DRY RUN] Executed simulated trade for ${asset} @ ${opportunity.profitPercent.toFixed(2)}% profit`);
+    } else {
+      // TODO: Place real orders
     }
+  }
+
+  private monitorOpenTrades(key: string, currentPrice: PriceData) {
+    // key is asset_expiry_strike_type
+    // currentPrice is the latest data for one exchange
+    
+    for (const trade of this.trades) {
+      if (trade.status !== 'OPEN') continue;
+
+      const tradeKey = this.getNormalizedKey(trade.opportunity.contract);
+      if (tradeKey !== key) continue;
+
+      // We need prices from BOTH exchanges to calculate current PnL accurately
+      const entries = this.prices.get(key);
+      if (!entries || entries.length < 2) continue;
+
+      const deribit = entries.find(e => e.exchange === "Deribit");
+      const bybit = entries.find(e => e.exchange === "Bybit");
+      if (!deribit || !bybit) continue;
+
+      // Calculate PnL (Simplified: current exit spread)
+      // If we bought Bybit and sold Deribit (useRoute1)
+      const buyExchangeData = trade.opportunity.buyExchange === "Deribit" ? deribit : bybit;
+      const sellExchangeData = trade.opportunity.sellExchange === "Deribit" ? deribit : bybit;
+
+      // To close: Sell bought leg (at its bid), Buy sold leg (at its ask)
+      const currentExitProfit = (sellExchangeData.bid - buyExchangeData.ask);
+      const entryProfit = (trade.opportunity.sellPrice - trade.opportunity.buyPrice);
+      
+      // If the spread has narrowed or inverted in our favor (target achieved)
+      // or if we hit a stop loss (not implemented yet)
+      const unrealizedPnL = (currentExitProfit - entryProfit) * trade.opportunity.tradableSize;
+      
+      // Auto-close if we captured 80% of the predicted potential profit or fixed %
+      if (unrealizedPnL > (trade.opportunity.potentialProfit * 0.8)) {
+        this.closeTrade(trade, unrealizedPnL);
+      }
+    }
+  }
+
+  private closeTrade(trade: TradeRecord, profit: number) {
+    console.log(`[EXECUTION] Closing trade ${trade.id} | Realized Profit: $${profit.toFixed(2)}`);
+    trade.status = 'CLOSED';
+    trade.profitActual = profit;
+    this.broadcast({ type: "TRADE_EXECUTED", data: trade }); // Update status in Flutter
   }
 
   private broadcast(message: any) {
