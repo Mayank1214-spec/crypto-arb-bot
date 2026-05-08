@@ -1,278 +1,289 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { Activity, Zap, TrendingUp, Shield, BarChart3, Clock } from 'lucide-react';
+import React, { useState, useMemo } from 'react';
+import { Activity, Zap, TrendingUp, BarChart3, LayoutDashboard, History, ListTodo, Settings as SettingsIcon } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
-
-interface OptionContract {
-  asset: string;
-  expiry: string;
-  strike: number;
-  type: 'CALL' | 'PUT';
-}
-
-interface Opportunity {
-  contract: OptionContract;
-  buyExchange: string;
-  buyPrice: number;
-  buyUnderlying: number;
-  sellExchange: string;
-  sellPrice: number;
-  sellUnderlying: number;
-  profitPercent: number;
-}
+import { useArbitrage } from './hooks/useArbitrage';
+import BalanceBar from './components/BalanceBar';
+import LogsPanel from './components/LogsPanel';
+import TradesTable from './components/TradesTable';
+import SettingsPanel from './components/SettingsPanel';
+import { TradeStatus } from './types';
 
 const App: React.FC = () => {
-  const [opportunities, setOpportunities] = useState<Opportunity[]>([]);
-  const [isConnected, setIsConnected] = useState(false);
-  const [stats, setStats] = useState({ totalProfit: 0, scanCount: 0 });
-  const [priceCount, setPriceCount] = useState(0);
-  const [matchedPairs, setMatchedPairs] = useState(0);
-  const [tickers, setTickers] = useState<any[]>([]);
-  const ws = useRef<WebSocket | null>(null);
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'trades' | 'logs' | 'settings'>('dashboard');
+  
+  const {
+    opportunities,
+    paperTrades,
+    tickers,
+    logs,
+    engineStatus,
+    isConnected,
+    autoExecutionEnabled,
+    balances,
+    toggleAutoExecution,
+    executePaperTrade,
+    closePaperTrade
+  } = useArbitrage();
 
-  useEffect(() => {
-    // Connect to the Cloudflare Worker WebSocket
-    // In production, this would be the actual worker URL
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = window.location.port === '5173' 
-      ? 'ws://localhost:7860' 
-      : `${protocol}//${window.location.host}`; 
-    ws.current = new WebSocket(wsUrl);
+  const totalRealizedProfit = useMemo(() => 
+    paperTrades
+      .filter(t => t.status === TradeStatus.closed)
+      .reduce((sum, t) => sum + (t.realizedProfit || 0), 0)
+  , [paperTrades]);
 
-    ws.current.onopen = () => setIsConnected(true);
-    ws.current.onclose = () => setIsConnected(false);
-    ws.current.onmessage = (event) => {
-      try {
-        const message = JSON.parse(event.data);
-        if (message.type === 'OPPORTUNITY') {
-          const newOpp = message.data;
-          setOpportunities(prev => {
-            const contractKey = `${newOpp.contract.asset}_${newOpp.contract.expiry}_${newOpp.contract.strike}`;
-            const filtered = prev.filter(o => `${o.contract.asset}_${o.contract.expiry}_${o.contract.strike}` !== contractKey);
-            return [newOpp, ...filtered].slice(0, 10);
-          });
-          setStats(prev => ({ 
-            totalProfit: prev.totalProfit + newOpp.profitPercent, 
-            scanCount: prev.scanCount + 1 
-          }));
-        } else if (message.type === 'STATUS') {
-          setPriceCount(message.data.priceCount);
-          setMatchedPairs(message.data.matchedPairs);
-        } else if (message.type === 'TICKER' && message.data?.contract) {
-          setTickers(prev => {
-            try {
-              const key = `${message.data.contract.asset}_${message.data.contract.expiry}_${message.data.contract.strike}_${message.data.contract.type}`;
-              const filtered = prev.filter(t => t?.contract && `${t.contract.asset}_${t.contract.expiry}_${t.contract.strike}_${t.contract.type}` !== key);
-              return [message.data, ...filtered].slice(0, 10);
-            } catch (e) {
-              console.error("Ticker processing error:", e);
-              return prev;
-            }
-          });
+  const unrealizedProfit = useMemo(() => {
+    let total = 0;
+    paperTrades.forEach(trade => {
+      if (trade.status === TradeStatus.open) {
+        const ticker = tickers.find(t => t.symbol === trade.entryOpportunity.symbol);
+        if (ticker) {
+          total += (ticker.bid - trade.entryBuyPrice) * trade.quantity + 
+                   (trade.entrySellPrice - ticker.ask) * trade.quantity - 
+                   trade.entryFees;
         }
-      } catch (e) {
-        console.error("Message parsing error:", e);
       }
-    };
-
-    return () => ws.current?.close();
-  }, []);
+    });
+    return total;
+  }, [paperTrades, tickers]);
 
   return (
-    <div className="min-h-screen">
+    <div className="min-h-screen bg-[#050505] text-white">
       {/* Navigation */}
-      <nav className="p-6 border-b border-white/10 flex justify-between items-center bg-black/20 backdrop-blur-md sticky top-0 z-50">
+      <nav className="p-4 border-b border-white/5 flex justify-between items-center bg-black/40 backdrop-blur-xl sticky top-0 z-50">
         <div className="flex items-center gap-3">
-          <div className="p-2 bg-blue-600 rounded-lg">
-            <Zap size={24} className="text-white" />
+          <div className="p-2 bg-gradient-to-br from-blue-600 to-purple-600 rounded-xl shadow-lg shadow-blue-500/20">
+            <Zap size={20} className="text-white" />
           </div>
-          <h1 className="text-xl font-bold gradient-text">ArbitrageX</h1>
+          <div>
+            <h1 className="text-lg font-black tracking-tighter gradient-text">ARBITRAGEX</h1>
+            <div className="flex items-center gap-1.5 -mt-1">
+              <div className={`w-1.5 h-1.5 rounded-full ${isConnected ? 'bg-emerald-500 animate-pulse' : 'bg-red-500'}`} />
+              <span className="text-[10px] font-bold text-gray-500 uppercase tracking-widest">
+                {isConnected ? 'Network Live' : 'Disconnected'}
+              </span>
+            </div>
+          </div>
         </div>
-        <div className="flex items-center gap-6">
-          <div className="flex items-center gap-2">
-            <div className={`live-indicator ${isConnected ? 'bg-emerald-500' : 'bg-red-500'}`} />
-            <span className="text-sm font-medium text-gray-400">
-              {isConnected ? 'Network Live' : 'Disconnected'}
-            </span>
-          </div>
-          <button className="px-4 py-2 bg-white/5 hover:bg-white/10 border border-white/10 rounded-full text-sm font-medium transition-all">
-            Settings
-          </button>
+
+        <div className="flex items-center bg-white/5 p-1 rounded-xl border border-white/10">
+          {[
+            { id: 'dashboard', icon: LayoutDashboard, label: 'Dashboard' },
+            { id: 'trades', icon: History, label: 'Trades' },
+            { id: 'logs', icon: ListTodo, label: 'Logs' },
+            { id: 'settings', icon: SettingsIcon, label: 'Settings' }
+          ].map((tab) => (
+            <button
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id as any)}
+              className={`flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-bold transition-all ${
+                activeTab === tab.id 
+                ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20' 
+                : 'text-gray-400 hover:text-white hover:bg-white/5'
+              }`}
+            >
+              <tab.icon size={14} />
+              <span className="hidden md:inline">{tab.label}</span>
+            </button>
+          ))}
         </div>
       </nav>
 
       <main className="max-w-7xl mx-auto p-6 space-y-8">
-        {/* Stats Grid */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          <motion.div 
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            className="glass-card stat-card"
-          >
-            <div className="flex justify-between items-start">
-              <span className="stat-label">Matching Pairs</span>
-              <Activity className="text-blue-400" size={20} />
-            </div>
-            <div className="stat-value">{matchedPairs}</div>
-            <p className="text-xs text-gray-400 mt-2">Scanning {priceCount} total prices</p>
-          </motion.div>
+        <BalanceBar 
+          balances={balances} 
+          totalPnL={totalRealizedProfit} 
+          unrealizedPnL={unrealizedProfit} 
+        />
 
-          <motion.div 
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 0.1 }}
-            className="glass-card stat-card"
-          >
-            <div className="flex justify-between items-start">
-              <span className="stat-label">Avg Profit</span>
-              <TrendingUp className="text-emerald-400" size={20} />
-            </div>
-            <div className="stat-value">{(stats.totalProfit / (stats.scanCount || 1)).toFixed(2)}%</div>
-            <p className="text-xs text-gray-400 mt-2">Max: 1.42%</p>
-          </motion.div>
+        <AnimatePresence mode="wait">
+          {activeTab === 'dashboard' && (
+            <motion.div 
+              key="dashboard"
+              initial={{ opacity: 0, x: -20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: 20 }}
+              className="space-y-8"
+            >
+              {/* Opportunities Grid */}
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                <section className="lg:col-span-2 glass-card overflow-hidden">
+                  <div className="p-6 border-b border-white/5 flex justify-between items-center bg-white/5">
+                    <h2 className="text-sm font-bold flex items-center gap-2 uppercase tracking-widest">
+                      <BarChart3 size={18} className="text-blue-400" />
+                      Live Arbitrage Feed
+                    </h2>
+                    <div className="flex gap-2">
+                      <span className="px-2 py-0.5 bg-blue-500/10 text-blue-400 text-[10px] font-bold rounded border border-blue-500/20">BTC-OPTIONS</span>
+                    </div>
+                  </div>
+                  
+                  <div className="p-0 overflow-x-auto">
+                    <table className="arbitrage-table">
+                      <thead>
+                        <tr>
+                          <th>Instrument</th>
+                          <th>Buy/Sell</th>
+                          <th>Spread</th>
+                          <th>Action</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <AnimatePresence mode="popLayout">
+                          {opportunities.length === 0 ? (
+                            <tr>
+                              <td colSpan={4} className="text-center py-20 text-gray-500">
+                                <div className="flex flex-col items-center gap-4">
+                                  <div className="w-12 h-12 border-4 border-blue-500/20 border-t-blue-500 rounded-full animate-spin" />
+                                  <span className="text-xs font-bold uppercase tracking-widest">Scanning market for edges...</span>
+                                </div>
+                              </td>
+                            </tr>
+                          ) : (
+                            opportunities.map((opp) => (
+                              <motion.tr 
+                                key={opp.symbol}
+                                initial={{ opacity: 0, x: -10 }}
+                                animate={{ opacity: 1, x: 0 }}
+                                exit={{ opacity: 0, scale: 0.95 }}
+                                layout
+                              >
+                                <td>
+                                  <div className="font-mono font-bold text-sm">{opp.asset}</div>
+                                  <div className="text-[10px] text-gray-500 font-bold uppercase tracking-tighter">
+                                    {opp.expiry} • {opp.strike} • {opp.type}
+                                  </div>
+                                </td>
+                                <td>
+                                  <div className="flex items-center gap-3">
+                                    <div>
+                                      <div className="text-[9px] text-gray-500 uppercase font-black">{opp.buyExchange}</div>
+                                      <div className="text-emerald-400 font-mono font-bold">${opp.buyPrice.toFixed(2)}</div>
+                                    </div>
+                                    <div className="w-px h-6 bg-white/10" />
+                                    <div>
+                                      <div className="text-[9px] text-gray-500 uppercase font-black">{opp.sellExchange}</div>
+                                      <div className="text-blue-400 font-mono font-bold">${opp.sellPrice.toFixed(2)}</div>
+                                    </div>
+                                  </div>
+                                </td>
+                                <td>
+                                  <span className="profit-badge text-xs px-3 py-1 bg-emerald-500 text-white font-black rounded-lg">
+                                    +{opp.profitPercent.toFixed(2)}%
+                                  </span>
+                                </td>
+                                <td>
+                                  <button 
+                                    onClick={() => executePaperTrade(opp, opp.tradableSize)}
+                                    className="p-2 bg-white/5 hover:bg-blue-600 hover:text-white rounded-lg transition-all border border-white/10 group"
+                                  >
+                                    <TrendingUp size={16} className="text-blue-400 group-hover:text-white" />
+                                  </button>
+                                </td>
+                              </motion.tr>
+                            ))
+                          )}
+                        </AnimatePresence>
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
 
-          <motion.div 
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 0.2 }}
-            className="glass-card stat-card"
-          >
-            <div className="flex justify-between items-start">
-              <span className="stat-label">Latency</span>
-              <Clock className="text-amber-400" size={20} />
-            </div>
-            <div className="stat-value">{priceCount}</div>
-            <p className="text-xs text-gray-400 mt-2">Active Market Prices</p>
-          </motion.div>
-        </div>
+                <div className="space-y-8">
+                   <LogsPanel logs={logs} />
+                   <SettingsPanel 
+                    autoExecutionEnabled={autoExecutionEnabled}
+                    onToggleAutoExecution={toggleAutoExecution}
+                    engineStatus={engineStatus}
+                  />
+                </div>
+              </div>
 
-        {/* Opportunities Table */}
-        <section className="glass-card overflow-hidden">
-          <div className="p-6 border-b border-white/10 flex justify-between items-center">
-            <h2 className="text-lg font-semibold flex items-center gap-2">
-              <BarChart3 size={20} className="text-blue-400" />
-              Live Arbitrage Feed
-            </h2>
-            <div className="flex gap-2">
-              <span className="px-3 py-1 bg-blue-500/10 text-blue-400 text-xs rounded-full border border-blue-500/20">BTC</span>
-              <span className="px-3 py-1 bg-purple-500/10 text-purple-400 text-xs rounded-full border border-purple-500/20">ETH</span>
-            </div>
-          </div>
-          
-          <div className="p-6 overflow-x-auto">
-            <table className="arbitrage-table">
-              <thead>
-                <tr>
-                  <th>Asset</th>
-                  <th>Expiry</th>
-                  <th>Strike</th>
-                  <th>Type</th>
-                  <th>Buy From</th>
-                  <th>Sell To</th>
-                  <th>Profit</th>
-                  <th>Underlying</th>
-                  <th>Action</th>
-                </tr>
-              </thead>
-              <tbody>
-                <AnimatePresence mode="popLayout">
-                  {opportunities.length === 0 ? (
-                    <tr>
-                      <td colSpan={8} className="text-center py-12 text-gray-500">
-                        Waiting for opportunities...
-                      </td>
-                    </tr>
-                  ) : (
-                    opportunities.map((opp, idx) => (
-                      <motion.tr 
-                        key={idx}
-                        initial={{ opacity: 0, x: -20 }}
-                        animate={{ opacity: 1, x: 0 }}
-                        exit={{ opacity: 0, scale: 0.95 }}
-                        layout
-                      >
-                        <td className="font-mono font-medium">{opp.contract.asset}</td>
-                        <td className="text-gray-400">{opp.contract.expiry}</td>
-                        <td className="font-mono">${opp.contract.strike}</td>
-                        <td>
-                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${opp.contract.type === 'CALL' ? 'bg-emerald-500/20 text-emerald-400' : 'bg-blue-500/20 text-blue-400'}`}>
-                            {opp.contract.type}
-                          </span>
-                        </td>
-                        <td>
-                          <div className="text-gray-300">{opp.buyExchange}</div>
-                          <div className="text-emerald-400 font-mono text-xs">${opp.buyPrice.toFixed(2)}</div>
-                        </td>
-                        <td>
-                          <div className="text-gray-300">{opp.sellExchange}</div>
-                          <div className="text-blue-400 font-mono text-xs">${opp.sellPrice.toFixed(2)}</div>
-                        </td>
-                        <td>
-                          <span className="profit-badge">
-                            +{opp.profitPercent.toFixed(2)}%
-                          </span>
-                        </td>
-                        <td className="text-[10px] text-gray-500">
-                          B: {opp.buyUnderlying.toFixed(1)}<br/>
-                          S: {opp.sellUnderlying.toFixed(1)}
-                        </td>
-                        <td>
-                          <button className="p-2 hover:bg-white/10 rounded-lg transition-colors text-blue-400">
-                            <Shield size={18} />
-                          </button>
-                        </td>
-                      </motion.tr>
-                    ))
-                  )}
-                </AnimatePresence>
-              </tbody>
-            </table>
-          </div>
-        </section>
-        {/* Live Market Feed */}
-        <section className="glass-card overflow-hidden">
-          <div className="p-6 border-b border-white/10">
-            <h2 className="text-lg font-semibold flex items-center gap-2">
-              <Activity size={20} className="text-emerald-400" />
-              Live Market Spreads (Deribit vs Bybit)
-            </h2>
-          </div>
-          <div className="p-6 overflow-x-auto">
-            <table className="arbitrage-table">
-              <thead>
-                <tr>
-                  <th>Instrument</th>
-                  <th>Bid (Buy Price)</th>
-                  <th>Ask (Sell Price)</th>
-                  <th>Spread %</th>
-                </tr>
-              </thead>
-              <tbody>
-                {tickers.length === 0 ? (
-                  <tr><td colSpan={4} className="text-center py-4 text-gray-500">Connecting to data feeds...</td></tr>
-                ) : (
-                  tickers.map((t, i) => (
-                    <tr key={i}>
-                      <td className="font-mono text-xs">
-                        {t?.contract?.asset}-{t?.contract?.expiry}-{t?.contract?.strike}-{t?.contract?.type}
-                      </td>
-                      <td>
-                        <span className="text-xs text-gray-500 mr-2">{t?.bidExchange}</span>
-                        <span className="font-mono text-emerald-400">${t?.bid?.toFixed(2)}</span>
-                      </td>
-                      <td>
-                        <span className="text-xs text-gray-500 mr-2">{t?.askExchange}</span>
-                        <span className="font-mono text-blue-400">${t?.ask?.toFixed(2)}</span>
-                      </td>
-                      <td className={(t?.spreadPercent || 0) > 0 ? 'text-emerald-400' : 'text-red-400'}>
-                        {t?.spreadPercent?.toFixed(3)}%
-                      </td>
-                    </tr>
-                  ))
-                )}
-              </tbody>
-            </table>
-          </div>
-        </section>
+              {/* Ticker Feed */}
+              <section className="glass-card overflow-hidden">
+                <div className="p-4 border-b border-white/5 bg-white/5">
+                  <h2 className="text-xs font-bold flex items-center gap-2 uppercase tracking-widest text-gray-400">
+                    <Activity size={16} className="text-emerald-400" />
+                    Market Pulse
+                  </h2>
+                </div>
+                <div className="p-4 grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-4">
+                  {tickers.slice(0, 10).map((t) => (
+                    <div key={t.symbol} className="p-3 bg-white/5 rounded-xl border border-white/5">
+                      <div className="text-[9px] font-black text-gray-500 truncate mb-1">{t.symbol}</div>
+                      <div className="flex justify-between items-end">
+                        <span className={`text-sm font-mono font-black ${t.spreadPercent > 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                          {t.spreadPercent.toFixed(3)}%
+                        </span>
+                        <div className="flex flex-col items-end">
+                          <span className="text-[8px] text-gray-600 font-bold uppercase">{t.bidExchange}/{t.askExchange}</span>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </section>
+            </motion.div>
+          )}
+
+          {activeTab === 'trades' && (
+            <motion.div 
+              key="trades"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              className="space-y-8"
+            >
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                <section className="glass-card overflow-hidden">
+                  <div className="p-6 border-b border-white/5 bg-blue-500/5">
+                    <h2 className="text-sm font-bold flex items-center gap-2 uppercase tracking-widest text-blue-400">
+                      <Zap size={18} />
+                      Active Positions
+                    </h2>
+                  </div>
+                  <TradesTable trades={paperTrades} onCloseTrade={closePaperTrade} />
+                </section>
+
+                <section className="glass-card overflow-hidden">
+                  <div className="p-6 border-b border-white/5 bg-emerald-500/5">
+                    <h2 className="text-sm font-bold flex items-center gap-2 uppercase tracking-widest text-emerald-400">
+                      <History size={18} />
+                      Trade History
+                    </h2>
+                  </div>
+                  <TradesTable trades={paperTrades} onCloseTrade={closePaperTrade} showHistory />
+                </section>
+              </div>
+            </motion.div>
+          )}
+
+          {activeTab === 'logs' && (
+            <motion.div 
+              key="logs"
+              initial={{ opacity: 0, scale: 0.98 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 1.02 }}
+            >
+              <LogsPanel logs={logs} />
+            </motion.div>
+          )}
+
+          {activeTab === 'settings' && (
+            <motion.div 
+              key="settings"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              className="max-w-2xl mx-auto"
+            >
+              <SettingsPanel 
+                autoExecutionEnabled={autoExecutionEnabled}
+                onToggleAutoExecution={toggleAutoExecution}
+                engineStatus={engineStatus}
+              />
+            </motion.div>
+          )}
+        </AnimatePresence>
       </main>
     </div>
   );
