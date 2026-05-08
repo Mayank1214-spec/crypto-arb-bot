@@ -61,7 +61,7 @@ export class ArbitrageEngine {
 
   // Configuration
   private dryRun = process.env.DRY_RUN !== 'false'; // Default to true for safety
-  private minProfitThreshold = -100.0; // Show EVERYTHING for debugging
+  private minProfitThreshold = 0.1; // 0.1% min profit to execute
   private maxPositionSize = 10.0; // Increased for testing (10 BTC / 100 ETH)
   private maxUsdPerTrade = 100000; // $100k cap for simulation
   
