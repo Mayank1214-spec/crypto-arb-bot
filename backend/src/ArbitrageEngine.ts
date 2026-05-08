@@ -25,6 +25,16 @@ interface Opportunity {
   potentialProfit: number;
 }
 
+interface TradeRecord {
+  id: string;
+  opportunity: Opportunity;
+  timestamp: number;
+  status: 'OPEN' | 'CLOSED' | 'ERROR';
+  buyOrderId?: string;
+  sellOrderId?: string;
+  profitActual?: number;
+}
+
 interface PriceData {
   bid: number;
   bidSize: number;
@@ -41,6 +51,7 @@ interface PriceData {
 export class ArbitrageEngine {
   private clients: Set<WebSocket> = new Set();
   private prices: Map<string, PriceData[]> = new Map();
+  private trades: TradeRecord[] = [];
   private indexBasisHistory: number[] = [];
   private lastUpdate = 0;
   private debugCount = 0;
@@ -48,7 +59,13 @@ export class ArbitrageEngine {
   private bybitDebugCount = 0;
   private activeSymbols: string[] = [];
 
+  // Configuration
+  private dryRun = process.env.DRY_RUN !== 'false'; // Default to true for safety
+  private minProfitThreshold = 0.5; // 0.5% min profit to execute
+  private maxPositionSize = 0.1; // 0.1 BTC or 1 ETH max per leg
+
   constructor() {
+    console.log(`[ENGINE] Starting in ${this.dryRun ? 'DRY RUN' : 'LIVE'} mode`);
     this.startExchangeConnections();
     
     // Broadcast status every 5 seconds so the user knows we are alive
@@ -392,8 +409,8 @@ export class ArbitrageEngine {
     // OPPORTUNITY: requires a real two-sided market on both exchanges
     if (!deribitBid || !deribitAsk || !bybitBid || !bybitAsk) return;
 
-    // Trigger on price spread > 0.1%. IV spread is a bonus signal, not a gate.
-    if (bestPricePct > 0.1) {
+    // Trigger on price spread > threshold
+    if (bestPricePct > this.minProfitThreshold) {
       const tradableSize = useRoute1 ? Math.min(deribit.bidSize, bybit.askSize) : Math.min(bybit.bidSize, deribit.askSize);
       if (tradableSize <= 0) return;
 
@@ -411,11 +428,47 @@ export class ArbitrageEngine {
         ivSpread:       bestIvSpread,
         indexMismatch:  currentMismatch,
         adjustedProfitPercent: bestPricePct,
-        tradableSize,
-        potentialProfit: (useRoute1 ? (deribitBid - bybitAsk) : (bybitBid - deribitAsk)) * tradableSize
+        tradableSize: Math.min(tradableSize, this.maxPositionSize),
+        potentialProfit: (useRoute1 ? (deribitBid - bybitAsk) : (bybitBid - deribitAsk)) * Math.min(tradableSize, this.maxPositionSize)
       };
+      
       this.broadcast({ type: "OPPORTUNITY", data: opportunity });
+      this.attemptExecution(opportunity);
+      
       console.log(`[ARB] ${contract.asset} ${contract.strike}${contract.type[0]} | Price: ${bestPricePct.toFixed(2)}% | IV Spread: ${bestIvSpread.toFixed(2)}% | Buy ${opportunity.buyExchange}@${opportunity.buyPrice.toFixed(0)} Sell ${opportunity.sellExchange}@${opportunity.sellPrice.toFixed(0)}`);
+    }
+  }
+
+  private async attemptExecution(opportunity: Opportunity) {
+    // Check if we already have an open trade for this symbol to avoid double entry
+    const existing = this.trades.find(t => t.opportunity.contract.asset === opportunity.contract.asset && t.status === 'OPEN');
+    if (existing) return;
+
+    console.log(`[EXECUTION] Attempting trade for ${opportunity.contract.asset}...`);
+    
+    const trade: TradeRecord = {
+      id: Date.now().toString(),
+      opportunity,
+      timestamp: Date.now(),
+      status: 'OPEN'
+    };
+
+    if (this.dryRun) {
+      console.log(`[DRY RUN] Executed simulated trade for ${opportunity.contract.asset} @ ${opportunity.profitPercent.toFixed(2)}% profit`);
+      this.trades.push(trade);
+      this.broadcast({ type: "TRADE_EXECUTED", data: trade });
+      return;
+    }
+
+    // TODO: Implement Real Execution Logic with API Keys
+    try {
+      // 1. Place Buy Order
+      // 2. Place Sell Order
+      // 3. Update trade status
+      this.trades.push(trade);
+      this.broadcast({ type: "TRADE_EXECUTED", data: trade });
+    } catch (e) {
+      console.error("[EXECUTION ERROR]", e);
     }
   }
 
