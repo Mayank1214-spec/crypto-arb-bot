@@ -110,7 +110,8 @@ const App: React.FC = () => {
                           <th>IV Spread</th>
                           <th>Price Spread</th>
                           <th>Size</th>
-                          <th>Est. Profit</th>
+                          <th>Depth</th>
+                          <th>Net Profit</th>
                           <th></th>
                         </tr>
                       </thead>
@@ -168,6 +169,11 @@ const App: React.FC = () => {
                                   </span>
                                 </td>
                                 <td className="font-mono text-xs text-slate-300">{opp.tradableSize.toFixed(2)}</td>
+                                <td>
+                                  <span className="px-1.5 py-0.5 bg-indigo-500/10 text-indigo-300 text-[10px] font-mono font-bold rounded">
+                                    L{opp.layersConsumed || 1}
+                                  </span>
+                                </td>
                                 <td className="font-mono text-sm font-bold text-emerald-400">${fmt(opp.potentialProfit)}</td>
                                 <td>
                                   <button

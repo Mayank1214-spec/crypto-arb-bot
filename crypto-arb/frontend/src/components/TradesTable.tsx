@@ -43,6 +43,7 @@ const TradesTable: React.FC<TradesTableProps> = ({ trades, tickers, onCloseTrade
             <th>Instrument</th>
             <th>Route</th>
             <th>Size</th>
+            <th>Depth</th>
             <th>Entry Spread</th>
             <th>{showHistory ? 'Realized P&L' : 'Unrealized P&L'}</th>
             <th>Duration</th>
@@ -98,6 +99,11 @@ const TradesTable: React.FC<TradesTableProps> = ({ trades, tickers, onCloseTrade
                       </div>
                     </td>
                     <td className="font-mono text-sm font-semibold">{trade.quantity.toFixed(2)}</td>
+                    <td>
+                      <span className="px-1.5 py-0.5 bg-indigo-500/10 text-indigo-300 text-[10px] font-mono font-bold rounded">
+                        L{trade.entryOpportunity.layersConsumed || 1}
+                      </span>
+                    </td>
                     <td>
                       <span className="badge-profit">{trade.entrySpreadPercent.toFixed(2)}%</span>
                     </td>

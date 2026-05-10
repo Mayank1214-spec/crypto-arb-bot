@@ -24,6 +24,7 @@ export interface Opportunity {
   adjustedProfitPercent: number;
   tradableSize: number;
   potentialProfit: number;
+  layersConsumed?: number;
   timestamp: number;
   symbol: string;
 }
