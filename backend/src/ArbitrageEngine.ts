@@ -23,6 +23,7 @@ interface Opportunity {
   adjustedProfitPercent: number;
   tradableSize: number;
   potentialProfit: number;
+  layersConsumed: number;
 }
 
 interface TradeRecord {
@@ -36,10 +37,8 @@ interface TradeRecord {
 }
 
 interface PriceData {
-  bid: number;
-  bidSize: number;
-  ask: number;
-  askSize: number;
+  bids: [number, number][]; // [price, size]
+  asks: [number, number][]; // [price, size]
   bidIv: number;
   askIv: number;
   underlyingPrice: number;
@@ -52,7 +51,7 @@ export class ArbitrageEngine {
   private clients: Set<WebSocket> = new Set();
   private prices: Map<string, PriceData[]> = new Map();
   private trades: TradeRecord[] = [];
-  private indexBasisHistory: number[] = [];
+  private indexBasisHistory: Map<string, number[]> = new Map();
   private lastUpdate = 0;
   private debugCount = 0;
   private matchedPairsCount = 0;
@@ -157,7 +156,7 @@ export class ArbitrageEngine {
             jsonrpc: "2.0",
             method: "public/subscribe",
             params: {
-              channels: batch.map(s => `ticker.${s}.100ms`)
+              channels: batch.flatMap(s => [`ticker.${s}.100ms`, `book.${s}.none.10.100ms`])
             },
             id: i
           };
@@ -172,7 +171,9 @@ export class ArbitrageEngine {
       try {
         const response = JSON.parse(data.toString());
         if (response.params && response.params.channel.startsWith("ticker")) {
-          this.updatePrice("Deribit", response.params.data);
+          this.updateTicker("Deribit", response.params.data);
+        } else if (response.params && response.params.channel.startsWith("book")) {
+          this.updateDepth("Deribit", response.params.data, "snapshot");
         }
       } catch (e) {}
     });
@@ -187,6 +188,7 @@ export class ArbitrageEngine {
   private connectBybit(symbols: string[]) {
     console.log("Attempting Bybit connection...");
     const ws = new WebSocket("wss://stream.bybit.com/v5/public/option");
+    let pingInterval: ReturnType<typeof setInterval> | null = null;
     
     ws.on('open', () => {
       console.log("Connected to Bybit Options ✅");
@@ -208,14 +210,14 @@ export class ArbitrageEngine {
           const batch = bybitSymbols.slice(i, i + 10);
           const subMsg = {
             op: "subscribe",
-            args: batch.map(s => `tickers.${s}`)
+            args: batch.flatMap(s => [`tickers.${s}`, `orderbook.25.${s}`])
           };
           ws.send(JSON.stringify(subMsg));
         }
       }
 
-      // Bybit heartbeat
-      setInterval(() => {
+      // Bybit heartbeat — store ref so we can clear on close
+      pingInterval = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ op: "ping" }));
         }
@@ -229,20 +231,69 @@ export class ArbitrageEngine {
           console.error("Bybit Subscription Failed:", response.ret_msg);
         }
         if (response.topic && response.topic.startsWith("tickers")) {
-          const rawData = response.data;
-          this.updatePrice("Bybit", rawData);
+          this.updateTicker("Bybit", response.data);
+        } else if (response.topic && response.topic.startsWith("orderbook")) {
+          this.updateDepth("Bybit", response.data, response.type);
         }
       } catch (e) {}
     });
 
     ws.on('error', (err: Error) => console.error('Bybit WS Error:', err.message));
     ws.on('close', () => {
+      if (pingInterval) clearInterval(pingInterval);
       console.log('Bybit connection closed. Reconnecting in 5s...');
       setTimeout(() => this.connectBybit(this.activeSymbols), 5000);
     });
   }
 
-  private updatePrice(exchange: string, rawData: any) {
+  private updateDepth(exchange: string, rawData: any, type: string) {
+    const rawSymbol = rawData.s || rawData.instrument_name || rawData.symbol;
+    if (!rawSymbol) return;
+    try {
+      let contract: OptionContract;
+      if (exchange === "Deribit") {
+        contract = this.parseDeribitSymbol(rawSymbol);
+      } else if (exchange === "Bybit") {
+        contract = this.parseBybitSymbol(rawSymbol);
+      } else {
+        return;
+      }
+
+      const normalizedKey = this.getNormalizedKey(contract);
+      let entries = this.prices.get(normalizedKey) || [];
+      let priceData = entries.find(e => e.exchange === exchange);
+
+      if (!priceData) {
+        priceData = { bids: [], asks: [], bidIv: 0, askIv: 0, underlyingPrice: 0, delta: 0, exchange, timestamp: Date.now() };
+        entries.push(priceData);
+      }
+
+      if (exchange === "Deribit") {
+        if (rawData.bids) priceData.bids = rawData.bids.map((x: any) => [parseFloat(x[0]), parseFloat(x[1])]);
+        if (rawData.asks) priceData.asks = rawData.asks.map((x: any) => [parseFloat(x[0]), parseFloat(x[1])]);
+      } else if (exchange === "Bybit") {
+        if (type === "snapshot" || (rawData.b && rawData.b.length > 5)) {
+          if (rawData.b) priceData.bids = rawData.b.map((x: any) => [parseFloat(x[0]), parseFloat(x[1])]);
+          if (rawData.a) priceData.asks = rawData.a.map((x: any) => [parseFloat(x[0]), parseFloat(x[1])]);
+        }
+      }
+
+      priceData.timestamp = Date.now();
+      this.prices.set(normalizedKey, entries);
+      this.lastUpdate = Date.now();
+
+      if (priceData.asks.length > 0 && priceData.bids.length > 0) {
+        // Only check arb if we have depth data.
+      if (priceData.asks.length > 0 && priceData.bids.length > 0) {
+        this.checkArbitrage(normalizedKey, contract, entries);
+      }
+      }
+    } catch (e) {
+      console.error(`[updateDepth] Error processing ${exchange} data:`, e);
+    }
+  }
+
+  private updateTicker(exchange: string, rawData: any) {
     const rawSymbol = rawData.s || rawData.instrument_name || rawData.symbol;
     if (!rawSymbol) return;
 
@@ -257,11 +308,7 @@ export class ArbitrageEngine {
       }
 
       const normalizedKey = this.getNormalizedKey(contract);
-      let bid = parseFloat(rawData.b || rawData.best_bid_price || rawData.bidPrice || rawData.bid1Price || 0);
-      let ask = parseFloat(rawData.a || rawData.best_ask_price || rawData.askPrice || rawData.ask1Price || 0);
 
-      // Deribit WebSocket stream sends 'underlying_price' (snake_case).
-      // Bybit sends 'underlyingPrice' (camelCase). index_price is REST-only on Deribit.
       const underlyingPrice = parseFloat(
         rawData.underlying_price ||   // Deribit WebSocket ticker
         rawData.underlyingPrice ||     // Bybit WebSocket ticker
@@ -271,52 +318,36 @@ export class ArbitrageEngine {
         0
       );
 
-      if (exchange === "Deribit") {
-        if (underlyingPrice === 0) {
-          // Can't convert BTC-denominated price to USD without underlying — skip
-          return;
-        }
-        bid = bid * underlyingPrice;
-        ask = ask * underlyingPrice;
-      }
-
-      // IV extraction:
-      // Deribit: bid_iv and ask_iv are already in percentage (e.g. 85.5 = 85.5%)
-      // Bybit:   bidIv and askIv are in decimal form (e.g. 0.855 = 85.5%)
       let bidIv = 0;
       let askIv = 0;
       if (exchange === "Deribit") {
         bidIv = parseFloat(rawData.bid_iv || 0);
         askIv = parseFloat(rawData.ask_iv || 0);
       } else {
-        // Bybit sends as decimal — multiply by 100
         bidIv = parseFloat(rawData.bidIv || 0) * 100;
         askIv = parseFloat(rawData.askIv || 0) * 100;
       }
 
-      const price: PriceData = {
-        bid,
-        bidSize: parseFloat(rawData.B || rawData.best_bid_amount || rawData.bidSize || rawData.bid1Size || 0),
-        ask,
-        askSize: parseFloat(rawData.A || rawData.best_ask_amount || rawData.askSize || rawData.ask1Size || 0),
-        bidIv,
-        askIv,
-        underlyingPrice,
-        delta: parseFloat(rawData.delta || (rawData.greeks && rawData.greeks.delta) || 0),
-        exchange,
-        timestamp: Date.now()
-      };
-
       let entries = this.prices.get(normalizedKey) || [];
-      entries = entries.filter(e => e.exchange !== exchange);
-      entries.push(price);
+      let priceData = entries.find(e => e.exchange === exchange);
+      
+      if (!priceData) {
+        priceData = { bids: [], asks: [], bidIv: 0, askIv: 0, underlyingPrice: 0, delta: 0, exchange, timestamp: Date.now() };
+        entries.push(priceData);
+      }
+
+      priceData.bidIv = bidIv;
+      priceData.askIv = askIv;
+      if (underlyingPrice > 0) priceData.underlyingPrice = underlyingPrice;
+      priceData.delta = parseFloat(rawData.delta || (rawData.greeks && rawData.greeks.delta) || 0);
+      priceData.timestamp = Date.now();
+
       this.prices.set(normalizedKey, entries);
       this.lastUpdate = Date.now();
       
-      this.checkArbitrage(normalizedKey, contract, entries);
-      this.monitorOpenTrades(normalizedKey, price);
+      this.monitorOpenTrades(normalizedKey, priceData);
     } catch (e) {
-      console.error(`[updatePrice] Error processing ${exchange} data:`, e);
+      console.error(`[updateTicker] Error processing ${exchange} data:`, e);
     }
   }
 
@@ -375,16 +406,23 @@ export class ArbitrageEngine {
     if (now - deribit.timestamp > 60_000 || now - bybit.timestamp > 60_000) return;
 
     // Use best available ask for spread display (ask always present if there's a market)
-    const deribitAsk = deribit.ask || 0;
-    const bybitAsk = bybit.ask || 0;
-    const deribitBid = deribit.bid || 0;
-    const bybitBid = bybit.bid || 0;
+    const dAsk = deribit.asks && deribit.asks.length > 0 ? deribit.asks[0][0] : 0;
+    const dBid = deribit.bids && deribit.bids.length > 0 ? deribit.bids[0][0] : 0;
+    const bAsk = bybit.asks && bybit.asks.length > 0 ? bybit.asks[0][0] : 0;
+    const bBid = bybit.bids && bybit.bids.length > 0 ? bybit.bids[0][0] : 0;
 
-    // OPTION A: Index Monitoring (Moving Basis)
+    const deribitAsk = dAsk * deribit.underlyingPrice;
+    const deribitBid = dBid * deribit.underlyingPrice;
+    const bybitAsk = bAsk;
+    const bybitBid = bBid;
+
+    // OPTION A: Index Monitoring (Moving Basis) — per-asset to avoid mixing BTC & ETH
     const rawBasis = deribit.underlyingPrice - bybit.underlyingPrice;
-    this.indexBasisHistory.push(rawBasis);
-    if (this.indexBasisHistory.length > 100) this.indexBasisHistory.shift();
-    const movingAverageBasis = this.indexBasisHistory.reduce((a, b) => a + b, 0) / this.indexBasisHistory.length;
+    const assetBasisHistory = this.indexBasisHistory.get(contract.asset) || [];
+    assetBasisHistory.push(rawBasis);
+    if (assetBasisHistory.length > 100) assetBasisHistory.shift();
+    this.indexBasisHistory.set(contract.asset, assetBasisHistory);
+    const movingAverageBasis = assetBasisHistory.reduce((a, b) => a + b, 0) / assetBasisHistory.length;
     const currentMismatch = deribit.underlyingPrice - bybit.underlyingPrice;
 
     // Price spread calculation (both routes)
@@ -418,53 +456,102 @@ export class ArbitrageEngine {
     // OPPORTUNITY: requires a real two-sided market on both exchanges
     if (!deribitBid || !deribitAsk || !bybitBid || !bybitAsk) return;
 
-    // Trigger on price spread > threshold
-    if (bestPricePct > this.minProfitThreshold) {
-      const tradableSize = useRoute1 ? Math.min(deribit.bidSize, bybit.askSize) : Math.min(bybit.bidSize, deribit.askSize);
-      if (tradableSize <= 0) return;
+    // Deep Book VWAP Calculation
+    const buyBook = useRoute1 ? bybit.asks : deribit.asks; // Arrays of [price, size]
+    const sellBook = useRoute1 ? deribit.bids : bybit.bids;
+    
+    if (!buyBook || !sellBook || buyBook.length === 0 || sellBook.length === 0) return;
 
+    let accumulatedSize = 0;
+    let accumulatedBuyCost = 0;
+    let accumulatedSellValue = 0;
+    let buyIdx = 0;
+    let sellIdx = 0;
+    let layersConsumed = 0;
+    const TAKER_FEE = 0.0003; // 0.03%
+
+    while (buyIdx < buyBook.length && sellIdx < sellBook.length && accumulatedSize < this.maxPositionSize) {
+      let bPrice = buyBook[buyIdx][0];
+      let bSize = buyBook[buyIdx][1];
+      let sPrice = sellBook[sellIdx][0];
+      let sSize = sellBook[sellIdx][1];
+
+      if (useRoute1) { // Buy Bybit, Sell Deribit
+        sPrice = sPrice * deribit.underlyingPrice;
+      } else { // Buy Deribit, Sell Bybit
+        bPrice = bPrice * deribit.underlyingPrice;
+      }
+
+      const layerSpread = sPrice - bPrice;
+      const layerFees = (sPrice + bPrice) * TAKER_FEE;
+      const layerNetProfit = layerSpread - layerFees;
+
+      if (layerNetProfit <= 0) break; // This layer is not profitable after fees
+
+      const takeSize = Math.min(bSize, sSize, this.maxPositionSize - accumulatedSize);
+      accumulatedSize += takeSize;
+      accumulatedBuyCost += bPrice * takeSize;
+      accumulatedSellValue += sPrice * takeSize;
+      layersConsumed = Math.max(buyIdx, sellIdx) + 1;
+
+      if (takeSize === bSize) buyIdx++;
+      if (takeSize === sSize) sellIdx++;
+    }
+
+    if (accumulatedSize <= 0) return;
+
+    const vwapBuyPrice = accumulatedBuyCost / accumulatedSize;
+    const vwapSellPrice = accumulatedSellValue / accumulatedSize;
+    const vwapProfitPercent = ((vwapSellPrice - vwapBuyPrice) / vwapBuyPrice) * 100;
+    const netAbsoluteProfit = accumulatedSellValue - accumulatedBuyCost - ((accumulatedSellValue + accumulatedBuyCost) * TAKER_FEE);
+
+    if (vwapProfitPercent > this.minProfitThreshold) {
       const opportunity: Opportunity = {
         contract,
         buyExchange:    useRoute1 ? "Bybit"   : "Deribit",
-        buyPrice:       useRoute1 ? bybitAsk  : deribitAsk,
+        buyPrice:       vwapBuyPrice,
         buyUnderlying:  useRoute1 ? bybit.underlyingPrice  : deribit.underlyingPrice,
         buyIv:          useRoute1 ? bybit.askIv : deribit.askIv,
         sellExchange:   useRoute1 ? "Deribit" : "Bybit",
-        sellPrice:      useRoute1 ? deribitBid : bybitBid,
+        sellPrice:      vwapSellPrice,
         sellUnderlying: useRoute1 ? deribit.underlyingPrice : bybit.underlyingPrice,
         sellIv:         useRoute1 ? deribit.bidIv : bybit.bidIv,
-        profitPercent:  bestPricePct,
+        profitPercent:  vwapProfitPercent,
         ivSpread:       bestIvSpread,
         indexMismatch:  currentMismatch,
-        adjustedProfitPercent: bestPricePct,
-        tradableSize: Math.min(tradableSize, this.maxPositionSize),
-        potentialProfit: (useRoute1 ? (deribitBid - bybitAsk) : (bybitBid - deribitAsk)) * Math.min(tradableSize, this.maxPositionSize)
+        adjustedProfitPercent: vwapProfitPercent,
+        tradableSize:   accumulatedSize,
+        potentialProfit: netAbsoluteProfit,
+        layersConsumed
       };
       
       this.broadcast({ type: "OPPORTUNITY", data: opportunity });
       this.attemptExecution(opportunity);
       
-      console.log(`[ARB] ${contract.asset} ${contract.strike}${contract.type[0]} | Price: ${bestPricePct.toFixed(2)}% | IV Spread: ${bestIvSpread.toFixed(2)}% | Buy ${opportunity.buyExchange}@${opportunity.buyPrice.toFixed(0)} Sell ${opportunity.sellExchange}@${opportunity.sellPrice.toFixed(0)}`);
+      console.log(`[ARB-DEPTH] ${contract.asset} ${contract.strike}${contract.type[0]} | Profit: $${netAbsoluteProfit.toFixed(2)} (${vwapProfitPercent.toFixed(2)}%) | Size: ${accumulatedSize.toFixed(4)} | Layers: ${layersConsumed}`);
     }
   }
 
   private async attemptExecution(opportunity: Opportunity) {
-    const asset = opportunity.contract.asset;
-    const existing = this.trades.find(t => t.opportunity.contract.asset === asset && t.status === 'OPEN');
+    // Guard: prevent duplicate trades on the same contract, not the entire asset class
+    const tradeKey = this.getNormalizedKey(opportunity.contract);
+    const existing = this.trades.find(t => this.getNormalizedKey(t.opportunity.contract) === tradeKey && t.status === 'OPEN');
     if (existing) return;
 
     const costUsd = opportunity.buyPrice * opportunity.tradableSize;
 
     // Simple balance check for simulation
+    // Deribit balance is in BTC — convert cost to BTC using underlying price
     if (this.dryRun) {
       if (opportunity.buyExchange === 'Bybit') {
         if (this.balances.Bybit < costUsd) {
-          console.log(`[DRY RUN] Insufficient Bybit balance for ${asset} ($${costUsd.toFixed(2)} > $${this.balances.Bybit.toFixed(2)})`);
+          console.log(`[DRY RUN] Insufficient Bybit balance for ${opportunity.contract.asset} ($${costUsd.toFixed(2)} > $${this.balances.Bybit.toFixed(2)})`);
           return;
         }
       } else if (opportunity.buyExchange === 'Deribit') {
-        if (this.balances.Deribit < opportunity.tradableSize) {
-          console.log(`[DRY RUN] Insufficient Deribit balance for ${asset} (${opportunity.tradableSize} > ${this.balances.Deribit})`);
+        const costInBtc = opportunity.buyUnderlying > 0 ? costUsd / opportunity.buyUnderlying : Infinity;
+        if (this.balances.Deribit < costInBtc) {
+          console.log(`[DRY RUN] Insufficient Deribit balance for ${opportunity.contract.asset} (${costInBtc.toFixed(4)} BTC > ${this.balances.Deribit.toFixed(4)} BTC)`);
           return;
         }
       }
@@ -475,11 +562,12 @@ export class ArbitrageEngine {
       if (opportunity.buyExchange === 'Bybit') {
         this.balances.Bybit -= costUsd;
       } else {
-        this.balances.Deribit -= opportunity.tradableSize;
+        const costInBtc = opportunity.buyUnderlying > 0 ? costUsd / opportunity.buyUnderlying : 0;
+        this.balances.Deribit -= costInBtc;
       }
     }
 
-    console.log(`[EXECUTION] Attempting trade for ${asset} | Size: ${opportunity.tradableSize} | Cost: $${costUsd.toFixed(2)}`);
+    console.log(`[EXECUTION] Attempting trade for ${opportunity.contract.asset} | Size: ${opportunity.tradableSize} | Cost: $${costUsd.toFixed(2)}`);
     
     const trade: TradeRecord = {
       id: Date.now().toString(),
@@ -492,7 +580,7 @@ export class ArbitrageEngine {
     this.broadcast({ type: "TRADE_EXECUTED", data: trade });
 
     if (this.dryRun) {
-      console.log(`[DRY RUN] Executed simulated trade for ${asset} @ ${opportunity.profitPercent.toFixed(2)}% profit`);
+      console.log(`[DRY RUN] Executed simulated trade for ${opportunity.contract.asset} @ ${opportunity.profitPercent.toFixed(2)}% profit`);
     } else {
       // TODO: Place real orders
     }
@@ -522,7 +610,9 @@ export class ArbitrageEngine {
       const sellExchangeData = trade.opportunity.sellExchange === "Deribit" ? deribit : bybit;
 
       // To close: Sell bought leg (at its bid), Buy sold leg (at its ask)
-      const currentExitProfit = (sellExchangeData.bid - buyExchangeData.ask);
+      const sellBid = sellExchangeData.bids && sellExchangeData.bids.length > 0 ? sellExchangeData.bids[0][0] : 0;
+      const buyAsk = buyExchangeData.asks && buyExchangeData.asks.length > 0 ? buyExchangeData.asks[0][0] : 0;
+      const currentExitProfit = (sellBid - buyAsk);
       const entryProfit = (trade.opportunity.sellPrice - trade.opportunity.buyPrice);
       
       // If the spread has narrowed or inverted in our favor (target achieved)
@@ -581,7 +671,8 @@ export class ArbitrageEngine {
         allSymbols = allSymbols.concat(symbols);
       }
     }
-    this.activeSymbols = allSymbols;
-    return allSymbols;
+    // Limit to max 100 contracts to prevent Websocket rate limits / OOM issues
+    this.activeSymbols = allSymbols.slice(0, 100);
+    return this.activeSymbols;
   }
 }

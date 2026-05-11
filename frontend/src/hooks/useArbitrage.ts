@@ -1,29 +1,101 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { TradeStatus } from '../types';
-import type { Opportunity, PaperTrade, Ticker, EngineStatus } from '../types';
+import type { Opportunity, PaperTrade, Ticker, EngineStatus, ExecutionEvent, TradeStats } from '../types';
 
 const BACKEND_URL = 'wss://mayank931154680-crypto-arb-bot.hf.space';
 const TAKER_FEE_RATE = 0.0003; // 0.03%
+
+/** Shared PnL calculation for both unrealized display and realized close */
+function calculateSpreadPnL(
+  entryBuyPrice: number,
+  entrySellPrice: number,
+  exitBuyPrice: number,
+  exitSellPrice: number,
+  quantity: number,
+  entryFees: number,
+  exitFees: number
+): number {
+  const entrySpread = (entrySellPrice - entryBuyPrice) * quantity;
+  const exitSpread = (exitBuyPrice - exitSellPrice) * quantity;
+  return entrySpread - exitSpread - entryFees - exitFees;
+}
 
 export const useArbitrage = () => {
   const [opportunities, setOpportunities] = useState<Opportunity[]>([]);
   const [paperTrades, setPaperTrades] = useState<PaperTrade[]>([]);
   const [tickers, setTickers] = useState<Ticker[]>([]);
   const [logs, setLogs] = useState<string[]>([]);
+  const [executionEvents, setExecutionEvents] = useState<ExecutionEvent[]>([]);
   const [engineStatus, setEngineStatus] = useState<EngineStatus | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const [autoExecutionEnabled, setAutoExecutionEnabled] = useState(true);
+  const [minProfitThreshold, setMinProfitThreshold] = useState(0.1);
   const [balances, setBalances] = useState<Record<string, number>>({
     'Deribit': 100.0,
     'Bybit': 1000000.0,
   });
 
   const ws = useRef<WebSocket | null>(null);
+  const tickersRef = useRef<Ticker[]>([]);
+  const autoExecutionRef = useRef(autoExecutionEnabled);
+  const eventIdRef = useRef(0);
 
-  const addLog = useCallback((message: string) => {
+  useEffect(() => { tickersRef.current = tickers; }, [tickers]);
+  useEffect(() => { autoExecutionRef.current = autoExecutionEnabled; }, [autoExecutionEnabled]);
+
+  const addLogEntry = useCallback((message: string) => {
     const time = new Date().toLocaleTimeString();
-    setLogs(prev => [`[${time}] ${message}`, ...prev].slice(0, 100));
+    setLogs(prev => [`[${time}] ${message}`, ...prev].slice(0, 200));
   }, []);
+
+  const addExecutionEvent = useCallback((type: ExecutionEvent['type'], message: string, data?: any) => {
+    const event: ExecutionEvent = {
+      id: ++eventIdRef.current,
+      timestamp: Date.now(),
+      type,
+      message,
+      data
+    };
+    setExecutionEvents(prev => [event, ...prev].slice(0, 500));
+  }, []);
+
+  // ─── Compute trade statistics ───
+  const tradeStats = useMemo((): TradeStats => {
+    const closedTrades = paperTrades.filter(t => t.status === TradeStatus.closed);
+    const openTrades = paperTrades.filter(t => t.status === TradeStatus.open);
+
+    const wins = closedTrades.filter(t => (t.realizedProfit || 0) > 0);
+    const losses = closedTrades.filter(t => (t.realizedProfit || 0) <= 0);
+    const totalRealized = closedTrades.reduce((sum, t) => sum + (t.realizedProfit || 0), 0);
+    const profits = closedTrades.map(t => t.realizedProfit || 0);
+
+    // Unrealized PnL
+    let totalUnrealized = 0;
+    openTrades.forEach(trade => {
+      const ticker = tickersRef.current.find(t => t.symbol === trade.entryOpportunity.symbol);
+      if (ticker) {
+        const entrySpread = (trade.entrySellPrice - trade.entryBuyPrice) * trade.quantity;
+        const exitSpread = (ticker.ask - ticker.bid) * trade.quantity;
+        totalUnrealized += entrySpread - exitSpread - trade.entryFees;
+      }
+    });
+
+    return {
+      totalTrades: paperTrades.length,
+      openTrades: openTrades.length,
+      closedTrades: closedTrades.length,
+      winCount: wins.length,
+      lossCount: losses.length,
+      winRate: closedTrades.length > 0 ? (wins.length / closedTrades.length) * 100 : 0,
+      totalRealizedProfit: totalRealized,
+      totalUnrealizedProfit: totalUnrealized,
+      avgProfitPerTrade: closedTrades.length > 0 ? totalRealized / closedTrades.length : 0,
+      bestTrade: profits.length > 0 ? Math.max(...profits) : 0,
+      worstTrade: profits.length > 0 ? Math.min(...profits) : 0,
+    };
+  }, [paperTrades, tickers]);
+
+  // ─── Message Handlers ───
 
   const handleNewOpportunity = useCallback((opp: any) => {
     const opportunity: Opportunity = {
@@ -48,12 +120,13 @@ export const useArbitrage = () => {
       return newOpps.slice(0, 50);
     });
 
-    addLog(`🔍 Opportunity: ${opportunity.symbol} (${opportunity.profitPercent.toFixed(2)}%)`);
-  }, [addLog]);
+    addExecutionEvent('OPPORTUNITY', `${opportunity.symbol} → ${opportunity.profitPercent.toFixed(2)}% spread`, opportunity);
+    addLogEntry(`🔍 Opportunity: ${opportunity.symbol} (${opportunity.profitPercent.toFixed(2)}%)`);
+  }, [addLogEntry, addExecutionEvent]);
 
   const handleTicker = useCallback((tickerData: any) => {
     const contract = tickerData.contract;
-    const symbol = contract 
+    const symbol = contract
       ? `${contract.asset}-${contract.expiry}-${contract.strike}-${contract.type}`
       : 'Unknown';
 
@@ -93,11 +166,16 @@ export const useArbitrage = () => {
       if (existingIndex !== -1) {
         const newTrades = [...prev];
         const trade = { ...newTrades[existingIndex] };
-        trade.status = status === 'OPEN' ? TradeStatus.open : TradeStatus.closed;
+        trade.status = status === 'OPEN' ? TradeStatus.open : status === 'ERROR' ? TradeStatus.error : TradeStatus.closed;
         if (status === 'CLOSED') {
           trade.realizedProfit = data.profitActual || 0;
           trade.exitTime = Date.now();
-          addLog(`📉 [BACKEND] Closed: ${trade.entryOpportunity.symbol} | Profit: $${trade.realizedProfit?.toFixed(2)}`);
+          addLogEntry(`📉 [BACKEND] Closed: ${trade.entryOpportunity.symbol} | Profit: $${trade.realizedProfit?.toFixed(2)}`);
+          addExecutionEvent('EXIT', `Closed ${trade.entryOpportunity.symbol} → $${trade.realizedProfit?.toFixed(2)}`, trade);
+        }
+        if (status === 'ERROR') {
+          addLogEntry(`❌ [BACKEND] Error on: ${trade.entryOpportunity.symbol}`);
+          addExecutionEvent('ERROR', `Trade error: ${trade.entryOpportunity.symbol}`, trade);
         }
         newTrades[existingIndex] = trade;
         return newTrades;
@@ -124,13 +202,15 @@ export const useArbitrage = () => {
           entrySellPrice: opportunity.sellPrice,
           entryFees: 0,
           status: status === 'OPEN' ? TradeStatus.open : TradeStatus.closed,
-          scaleCount: 0
+          scaleCount: 0,
+          source: 'backend'
         };
-        addLog(`🚀 [BACKEND] Executed: ${newTrade.entryOpportunity.symbol} @ ${newTrade.entryProfitPercent.toFixed(2)}%`);
+        addLogEntry(`🚀 [BACKEND] Executed: ${newTrade.entryOpportunity.symbol} @ ${newTrade.entryProfitPercent.toFixed(2)}%`);
+        addExecutionEvent('ENTRY', `Opened ${newTrade.entryOpportunity.symbol} @ ${newTrade.entryProfitPercent.toFixed(2)}%`, newTrade);
         return [newTrade, ...prev];
       }
     });
-  }, [addLog]);
+  }, [addLogEntry, addExecutionEvent]);
 
   const executePaperTrade = useCallback((opportunity: Opportunity, quantity: number) => {
     const buyCost = opportunity.buyPrice * quantity;
@@ -163,83 +243,101 @@ export const useArbitrage = () => {
       entrySellPrice: opportunity.sellPrice,
       entryFees,
       status: TradeStatus.open,
-      scaleCount: 0
+      scaleCount: 0,
+      source: 'local'
     };
 
     setPaperTrades(prev => [trade, ...prev]);
-    addLog(`🚀 [LOCAL] Executed: ${opportunity.symbol} @ ${opportunity.profitPercent.toFixed(2)}%`);
-  }, [addLog]);
+    addLogEntry(`🚀 [LOCAL] Executed: ${opportunity.symbol} @ ${opportunity.profitPercent.toFixed(2)}%`);
+    addExecutionEvent('ENTRY', `[LOCAL] Opened ${opportunity.symbol} @ ${opportunity.profitPercent.toFixed(2)}%`, trade);
+  }, [addLogEntry, addExecutionEvent]);
 
   const closePaperTrade = useCallback((trade: PaperTrade) => {
     if (trade.status === TradeStatus.closed) return;
 
-    setTickers(currentTickers => {
-      const ticker = currentTickers.find(t => t.symbol === trade.entryOpportunity.symbol);
-      
-      const exitSellPrice = ticker ? ticker.bid : trade.entryOpportunity.sellPrice;
-      const exitBuyPrice = ticker ? ticker.ask : trade.entryOpportunity.buyPrice;
-      
-      const exitSellValue = exitSellPrice * trade.quantity;
-      const exitBuyCost = exitBuyPrice * trade.quantity;
-      const exitFees = (exitSellValue + exitBuyCost) * TAKER_FEE_RATE;
-      
-      const realizedProfit = (exitSellValue - (trade.entryBuyPrice * trade.quantity)) + 
-                             ((trade.entrySellPrice * trade.quantity) - exitBuyCost) - 
-                             trade.entryFees - exitFees;
+    const ticker = tickersRef.current.find(t => t.symbol === trade.entryOpportunity.symbol);
+    const exitSellPrice = ticker ? ticker.bid : trade.entryOpportunity.sellPrice;
+    const exitBuyPrice = ticker ? ticker.ask : trade.entryOpportunity.buyPrice;
+    const exitSellValue = exitSellPrice * trade.quantity;
+    const exitBuyCost = exitBuyPrice * trade.quantity;
+    const exitFees = (exitSellValue + exitBuyCost) * TAKER_FEE_RATE;
 
-      setPaperTrades(prev => {
-        const index = prev.findIndex(t => t.id === trade.id);
-        if (index === -1) return prev;
-        const newTrades = [...prev];
-        newTrades[index] = {
-          ...trade,
-          status: TradeStatus.closed,
-          exitTime: Date.now(),
-          exitSellPrice,
-          exitBuyPrice,
-          exitFees,
-          realizedProfit
-        };
-        return newTrades;
-      });
+    const realizedProfit = calculateSpreadPnL(
+      trade.entryBuyPrice, trade.entrySellPrice,
+      exitBuyPrice, exitSellPrice,
+      trade.quantity, trade.entryFees, exitFees
+    );
 
-      setBalances(prev => ({
-        ...prev,
-        'Bybit': (prev['Bybit'] || 0) + realizedProfit
-      }));
-
-      addLog(`📉 [LOCAL] Closed: ${trade.entryOpportunity.symbol} | Profit: $${realizedProfit.toFixed(2)}`);
-      
-      return currentTickers;
+    setPaperTrades(prev => {
+      const index = prev.findIndex(t => t.id === trade.id);
+      if (index === -1) return prev;
+      const newTrades = [...prev];
+      newTrades[index] = {
+        ...trade,
+        status: TradeStatus.closed,
+        exitTime: Date.now(),
+        exitSellPrice, exitBuyPrice, exitFees, realizedProfit
+      };
+      return newTrades;
     });
-  }, [addLog]);
+
+    setBalances(prev => {
+      const newBalances = { ...prev };
+      const opp = trade.entryOpportunity;
+      if (opp.buyExchange === 'Bybit') {
+        newBalances['Bybit'] = (prev['Bybit'] || 0) + exitSellValue - (exitSellValue * TAKER_FEE_RATE) + realizedProfit;
+        newBalances['Deribit'] = (prev['Deribit'] || 0) - (exitBuyPrice / (opp.sellUnderlying || 1) * trade.quantity);
+      } else {
+        newBalances['Bybit'] = (prev['Bybit'] || 0) - exitBuyCost - (exitBuyCost * TAKER_FEE_RATE) + realizedProfit;
+        newBalances['Deribit'] = (prev['Deribit'] || 0) + (exitSellPrice / (opp.buyUnderlying || 1) * trade.quantity);
+      }
+      return newBalances;
+    });
+
+    addLogEntry(`📉 [LOCAL] Closed: ${trade.entryOpportunity.symbol} | Profit: $${realizedProfit.toFixed(2)}`);
+    addExecutionEvent('EXIT', `[LOCAL] Closed ${trade.entryOpportunity.symbol} → $${realizedProfit.toFixed(2)}`, { ...trade, realizedProfit });
+  }, [addLogEntry, addExecutionEvent]);
+
+  // ─── WebSocket (stable, no handler deps) ───
+  const handlersRef = useRef({ handleNewOpportunity, handleTicker, handleBackendTrade, addLogEntry, addExecutionEvent });
+  useEffect(() => {
+    handlersRef.current = { handleNewOpportunity, handleTicker, handleBackendTrade, addLogEntry, addExecutionEvent };
+  });
 
   useEffect(() => {
-    ws.current = new WebSocket(BACKEND_URL);
+    const socket = new WebSocket(BACKEND_URL);
+    ws.current = socket;
 
-    ws.current.onopen = () => {
+    socket.onopen = () => {
       setIsConnected(true);
-      addLog('📡 Connected to backend');
+      handlersRef.current.addLogEntry('📡 Connected to backend');
+      handlersRef.current.addExecutionEvent('STATUS', 'WebSocket connected to backend');
     };
-    ws.current.onclose = () => {
+    socket.onclose = () => {
       setIsConnected(false);
-      addLog('❌ Disconnected from backend');
+      handlersRef.current.addLogEntry('❌ Disconnected from backend');
+      handlersRef.current.addExecutionEvent('STATUS', 'WebSocket disconnected');
     };
-    ws.current.onmessage = (event) => {
+    socket.onmessage = (event) => {
       try {
         const message = JSON.parse(event.data);
+        const h = handlersRef.current;
         switch (message.type) {
           case 'OPPORTUNITY':
-            handleNewOpportunity(message.data);
+            h.handleNewOpportunity(message.data);
             break;
           case 'TICKER':
-            handleTicker(message.data);
+            h.handleTicker(message.data);
             break;
           case 'STATUS':
             setEngineStatus(message.data);
             break;
-          case 'TRADE':
-            handleBackendTrade(message.data);
+          case 'TRADE_EXECUTED':
+            h.handleBackendTrade(message.data);
+            break;
+          case 'WELCOME':
+            h.addLogEntry(`✅ ${message.message}`);
+            h.addExecutionEvent('STATUS', message.message);
             break;
         }
       } catch (e) {
@@ -247,21 +345,36 @@ export const useArbitrage = () => {
       }
     };
 
-    return () => ws.current?.close();
-  }, [handleNewOpportunity, handleTicker, handleBackendTrade, addLog]);
+    return () => socket.close();
+  }, []);
 
-  // Monitor open positions for auto-close/scale
+  // ─── Expire stale opportunities ───
+  useEffect(() => {
+    const cleanup = setInterval(() => {
+      setOpportunities(prev => {
+        const now = Date.now();
+        const filtered = prev.filter(o => now - o.timestamp < 60_000);
+        return filtered.length !== prev.length ? filtered : prev;
+      });
+    }, 10_000);
+    return () => clearInterval(cleanup);
+  }, []);
+
+  // ─── Auto-close monitor ───
   useEffect(() => {
     const interval = setInterval(() => {
+      if (!autoExecutionRef.current) return;
+      const currentTickers = tickersRef.current;
       setPaperTrades(trades => {
         trades.forEach(trade => {
           if (trade.status === TradeStatus.open) {
-            const ticker = tickers.find(t => t.symbol === trade.entryOpportunity.symbol);
+            const ticker = currentTickers.find(t => t.symbol === trade.entryOpportunity.symbol);
             if (ticker) {
-              const currentPnL = (ticker.bid - trade.entryBuyPrice) * trade.quantity + 
-                                (trade.entrySellPrice - ticker.ask) * trade.quantity - 
-                                trade.entryFees;
-              
+              const currentPnL = calculateSpreadPnL(
+                trade.entryBuyPrice, trade.entrySellPrice,
+                ticker.ask, ticker.bid,
+                trade.quantity, trade.entryFees, 0
+              );
               if (currentPnL >= trade.targetProfit && trade.targetProfit > 0) {
                 closePaperTrade(trade);
               }
@@ -272,18 +385,22 @@ export const useArbitrage = () => {
       });
     }, 5000);
     return () => clearInterval(interval);
-  }, [tickers, closePaperTrade]);
+  }, [closePaperTrade]);
 
   return {
     opportunities,
     paperTrades,
     tickers,
     logs,
+    executionEvents,
     engineStatus,
     isConnected,
     autoExecutionEnabled,
+    minProfitThreshold,
     balances,
+    tradeStats,
     toggleAutoExecution: () => setAutoExecutionEnabled(prev => !prev),
+    setMinProfitThreshold,
     executePaperTrade,
     closePaperTrade
   };

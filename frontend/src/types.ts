@@ -24,14 +24,18 @@ export interface Opportunity {
   adjustedProfitPercent: number;
   tradableSize: number;
   potentialProfit: number;
+  layersConsumed?: number;
   timestamp: number;
   symbol: string;
 }
 
-export enum TradeStatus {
-  open = 'open',
-  closed = 'closed'
-}
+export const TradeStatus = {
+  open: 'open',
+  closed: 'closed',
+  error: 'error'
+} as const;
+
+export type TradeStatus = typeof TradeStatus[keyof typeof TradeStatus];
 
 export interface PaperTrade {
   id: string;
@@ -51,11 +55,14 @@ export interface PaperTrade {
   exitFees?: number;
   realizedProfit?: number;
   scaleCount: number;
+  source: 'local' | 'backend';
 }
 
 export interface EngineStatus {
   priceCount: number;
   matchedPairs: number;
+  deribitCount: number;
+  bybitCount: number;
   lastUpdate: number;
   exchanges: string[];
 }
@@ -71,4 +78,26 @@ export interface Ticker {
   indexMismatch: number;
   movingBasis: number;
   adjustedProfitPercent: number;
+}
+
+export interface ExecutionEvent {
+  id: number;
+  timestamp: number;
+  type: 'ENTRY' | 'EXIT' | 'OPPORTUNITY' | 'STATUS' | 'ERROR';
+  message: string;
+  data?: any;
+}
+
+export interface TradeStats {
+  totalTrades: number;
+  openTrades: number;
+  closedTrades: number;
+  winCount: number;
+  lossCount: number;
+  winRate: number;
+  totalRealizedProfit: number;
+  totalUnrealizedProfit: number;
+  avgProfitPerTrade: number;
+  bestTrade: number;
+  worstTrade: number;
 }
