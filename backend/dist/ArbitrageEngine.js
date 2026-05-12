@@ -215,11 +215,49 @@ export class ArbitrageEngine {
                     priceData.asks = rawData.asks.map((x) => [parseFloat(x[0]), parseFloat(x[1])]);
             }
             else if (exchange === "Bybit") {
-                if (type === "snapshot" || (rawData.b && rawData.b.length > 5)) {
+                if (type === "snapshot") {
                     if (rawData.b)
                         priceData.bids = rawData.b.map((x) => [parseFloat(x[0]), parseFloat(x[1])]);
                     if (rawData.a)
                         priceData.asks = rawData.a.map((x) => [parseFloat(x[0]), parseFloat(x[1])]);
+                }
+                else if (type === "delta") {
+                    if (rawData.b) {
+                        for (const update of rawData.b) {
+                            const price = parseFloat(update[0]);
+                            const size = parseFloat(update[1]);
+                            const idx = priceData.bids.findIndex(x => x[0] === price);
+                            if (size === 0) {
+                                if (idx !== -1)
+                                    priceData.bids.splice(idx, 1);
+                            }
+                            else {
+                                if (idx !== -1)
+                                    priceData.bids[idx][1] = size;
+                                else
+                                    priceData.bids.push([price, size]);
+                            }
+                        }
+                        priceData.bids.sort((a, b) => b[0] - a[0]); // Bids descending
+                    }
+                    if (rawData.a) {
+                        for (const update of rawData.a) {
+                            const price = parseFloat(update[0]);
+                            const size = parseFloat(update[1]);
+                            const idx = priceData.asks.findIndex(x => x[0] === price);
+                            if (size === 0) {
+                                if (idx !== -1)
+                                    priceData.asks.splice(idx, 1);
+                            }
+                            else {
+                                if (idx !== -1)
+                                    priceData.asks[idx][1] = size;
+                                else
+                                    priceData.asks.push([price, size]);
+                            }
+                        }
+                        priceData.asks.sort((a, b) => a[0] - b[0]); // Asks ascending
+                    }
                 }
             }
             priceData.timestamp = Date.now();
@@ -750,17 +788,31 @@ export class ArbitrageEngine {
             // If we bought Bybit and sold Deribit (useRoute1)
             const buyExchangeData = trade.opportunity.buyExchange === "Deribit" ? deribit : bybit;
             const sellExchangeData = trade.opportunity.sellExchange === "Deribit" ? deribit : bybit;
-            // To close: Sell bought leg (at its bid), Buy sold leg (at its ask)
-            const sellBid = sellExchangeData.bids && sellExchangeData.bids.length > 0 ? sellExchangeData.bids[0][0] : 0;
-            const buyAsk = buyExchangeData.asks && buyExchangeData.asks.length > 0 ? buyExchangeData.asks[0][0] : 0;
-            const currentExitProfit = (sellBid - buyAsk);
-            const entryProfit = (trade.opportunity.sellPrice - trade.opportunity.buyPrice);
-            // If the spread has narrowed or inverted in our favor (target achieved)
-            // or if we hit a stop loss (not implemented yet)
-            const unrealizedPnL = (currentExitProfit - entryProfit) * trade.opportunity.tradableSize;
-            // Auto-close if we captured 80% of the predicted potential profit or fixed %
-            if (unrealizedPnL > (trade.opportunity.potentialProfit * 0.8)) {
-                this.closeTrade(trade, unrealizedPnL);
+            // To close LONG leg (we originally bought): we must SELL at the current BID
+            let closeLongPrice = buyExchangeData.bids && buyExchangeData.bids.length > 0 ? buyExchangeData.bids[0][0] : 0;
+            if (trade.opportunity.buyExchange === "Deribit")
+                closeLongPrice *= buyExchangeData.underlyingPrice;
+            // To close SHORT leg (we originally sold): we must BUY at the current ASK
+            let closeShortPrice = sellExchangeData.asks && sellExchangeData.asks.length > 0 ? sellExchangeData.asks[0][0] : 0;
+            if (trade.opportunity.sellExchange === "Deribit")
+                closeShortPrice *= sellExchangeData.underlyingPrice;
+            if (!closeLongPrice || !closeShortPrice)
+                continue;
+            // PnL Math
+            const entryFees = ((trade.opportunity.sellPrice - trade.opportunity.buyPrice) * trade.opportunity.tradableSize) - trade.opportunity.potentialProfit;
+            const totalExitCost = closeShortPrice * trade.opportunity.tradableSize;
+            const totalExitRev = closeLongPrice * trade.opportunity.tradableSize;
+            const standardBuyFee = buyExchangeData.underlyingPrice * 0.0003;
+            const standardSellFee = sellExchangeData.underlyingPrice * 0.0003;
+            const closeLongFee = Math.min(standardBuyFee, closeLongPrice * 0.125);
+            const closeShortFee = Math.min(standardSellFee, closeShortPrice * 0.125);
+            const totalExitFees = (closeLongFee + closeShortFee) * trade.opportunity.tradableSize;
+            const currentNetPnL = (trade.opportunity.sellPrice * trade.opportunity.tradableSize - trade.opportunity.buyPrice * trade.opportunity.tradableSize)
+                + (totalExitRev - totalExitCost)
+                - entryFees - totalExitFees;
+            // Auto-close if we captured 80% of the predicted potential profit
+            if (currentNetPnL > (trade.opportunity.potentialProfit * 0.8)) {
+                this.closeTrade(trade, currentNetPnL);
             }
         }
     }
