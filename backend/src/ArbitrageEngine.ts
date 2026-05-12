@@ -190,7 +190,7 @@ export class ArbitrageEngine {
     const ws = new WebSocket("wss://stream.bybit.com/v5/public/option");
     let pingInterval: ReturnType<typeof setInterval> | null = null;
     
-    ws.on('open', () => {
+    ws.on('open', async () => {
       console.log("Connected to Bybit Options ✅");
       if (symbols.length > 0) {
         // Transform Deribit symbols to Bybit format:
@@ -213,6 +213,7 @@ export class ArbitrageEngine {
             args: batch.flatMap(s => [`tickers.${s}`, `orderbook.25.${s}`])
           };
           ws.send(JSON.stringify(subMsg));
+          await new Promise(r => setTimeout(r, 100)); // Sleep to avoid Bybit rate limit
         }
       }
 
@@ -695,8 +696,8 @@ export class ArbitrageEngine {
         allSymbols = allSymbols.concat(symbols);
       }
     }
-    // Limit to max 100 contracts to prevent Websocket rate limits / OOM issues
-    this.activeSymbols = allSymbols.slice(0, 100);
+    // Limit to max 500 contracts to scan more market but prevent complete OOM
+    this.activeSymbols = allSymbols.slice(0, 500);
     return this.activeSymbols;
   }
 }
