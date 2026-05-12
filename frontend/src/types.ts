@@ -27,6 +27,7 @@ export interface Opportunity {
   layersConsumed?: number;
   timestamp: number;
   symbol: string;
+  executionType?: 'ORDERBOOK' | 'SINGLE_RFQ' | 'DUAL_RFQ';
 }
 
 export const TradeStatus = {

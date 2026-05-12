@@ -43,7 +43,7 @@ const TradesTable: React.FC<TradesTableProps> = ({ trades, tickers, onCloseTrade
             <th>Instrument</th>
             <th>Route</th>
             <th>Size</th>
-            <th>Depth</th>
+            <th>Execution</th>
             <th>Entry Spread</th>
             <th>{showHistory ? 'Realized P&L' : 'Unrealized P&L'}</th>
             <th>Duration</th>
@@ -100,9 +100,21 @@ const TradesTable: React.FC<TradesTableProps> = ({ trades, tickers, onCloseTrade
                     </td>
                     <td className="font-mono text-sm font-semibold">{trade.quantity.toFixed(2)}</td>
                     <td>
-                      <span className="px-1.5 py-0.5 bg-indigo-500/10 text-indigo-300 text-[10px] font-mono font-bold rounded">
-                        L{trade.entryOpportunity.layersConsumed || 1}
-                      </span>
+                      <div className="flex flex-col gap-1.5 items-start">
+                        {trade.entryOpportunity.executionType && trade.entryOpportunity.executionType !== 'ORDERBOOK' ? (
+                          <span className={`px-1.5 py-0.5 text-[9px] font-mono font-bold rounded uppercase tracking-wider ${
+                            trade.entryOpportunity.executionType === 'DUAL_RFQ' 
+                              ? 'bg-amber-500/10 text-amber-400 border border-amber-500/20' 
+                              : 'bg-fuchsia-500/10 text-fuchsia-400 border border-fuchsia-500/20'
+                          }`}>
+                            {trade.entryOpportunity.executionType.replace('_', ' ')}
+                          </span>
+                        ) : (
+                          <span className="px-1.5 py-0.5 bg-indigo-500/10 text-indigo-300 text-[10px] font-mono font-bold rounded">
+                            VWAP L{trade.entryOpportunity.layersConsumed || 1}
+                          </span>
+                        )}
+                      </div>
                     </td>
                     <td>
                       <span className="badge-profit">{trade.entrySpreadPercent.toFixed(2)}%</span>
