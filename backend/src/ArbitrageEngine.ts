@@ -26,15 +26,17 @@ interface Opportunity {
   layersConsumed: number;
 }
 
-interface RfqState {
+interface DualRfqState {
   id: string;
   contract: OptionContract;
   buyExchange: string;
   sellExchange: string;
   size: number;
   timestamp: number;
-  status: 'PENDING' | 'QUOTED' | 'EXPIRED' | 'EXECUTED';
+  status: 'PENDING' | 'PARTIAL' | 'QUOTED' | 'EXPIRED' | 'EXECUTED';
   originalSpread: number;
+  buyQuote?: number;
+  sellQuote?: number;
 }
 
 interface TradeRecord {
@@ -68,7 +70,7 @@ export class ArbitrageEngine {
   private matchedPairsCount = 0;
   private bybitDebugCount = 0;
   private activeSymbols: string[] = [];
-  private activeRfqs: Map<string, RfqState> = new Map();
+  private activeDualRfqs: Map<string, DualRfqState> = new Map();
 
   // Configuration
   private dryRun = process.env.DRY_RUN !== 'false'; // Default to true for safety
@@ -513,12 +515,12 @@ export class ArbitrageEngine {
       const layerNetProfit = layerSpread - layerFees;
 
       if (layerNetProfit <= 0) {
-        // If the spread itself is profitable but killed by fees, trigger an RFQ for the effective size
+        // If the spread itself is profitable but killed by fees, trigger a DUAL-RFQ for the effective size
         const rawProfitPercent = (layerSpread / bPrice) * 100;
         if (layerSpread > 0 && rawProfitPercent > this.minProfitThreshold) {
           const buyEx = useRoute1 ? "Bybit" : "Deribit";
           const sellEx = useRoute1 ? "Deribit" : "Bybit";
-          this.triggerRfq(contract, buyEx, sellEx, effectiveMaxSize, layerSpread);
+          this.triggerDualRfq(contract, buyEx, sellEx, effectiveMaxSize, layerSpread);
         }
         break; // Still break standard VWAP execution
       }
@@ -578,18 +580,18 @@ export class ArbitrageEngine {
     }
   }
 
-  private triggerRfq(contract: OptionContract, buyExchange: string, sellExchange: string, size: number, spread: number) {
+  private triggerDualRfq(contract: OptionContract, buyExchange: string, sellExchange: string, size: number, spread: number) {
     const key = this.getNormalizedKey(contract);
-    if (this.activeRfqs.has(key)) {
-       const existing = this.activeRfqs.get(key)!;
-       if (existing.status === 'PENDING' || Date.now() - existing.timestamp < 10000) return; // 10s cooldown
+    if (this.activeDualRfqs.has(key)) {
+       const existing = this.activeDualRfqs.get(key)!;
+       if (['PENDING', 'PARTIAL'].includes(existing.status) || Date.now() - existing.timestamp < 10000) return; // 10s cooldown
     }
 
     // Block trades usually require high minimums, filter out tiny retail noise
     if (size < 1.0) return;
 
-    const rfq: RfqState = {
-      id: `RFQ-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+    const rfq: DualRfqState = {
+      id: `DRFQ-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       contract,
       buyExchange,
       sellExchange,
@@ -599,26 +601,29 @@ export class ArbitrageEngine {
       originalSpread: spread
     };
 
-    this.activeRfqs.set(key, rfq);
-    console.log(`[RFQ] Broadcasted block quote request: ${contract.asset} ${contract.strike}${contract.type[0]} on ${buyExchange} (Size: ${size.toFixed(2)})`);
+    this.activeDualRfqs.set(key, rfq);
+    console.log(`[DUAL-RFQ] Broadcasted dual block quote request: ${contract.asset} ${contract.strike}${contract.type[0]} on ${buyExchange} & ${sellExchange} (Size: ${size.toFixed(2)})`);
     
-    // Simulate Market Maker pricing algo latency (300ms - 1500ms)
-    const latency = 300 + Math.random() * 1200;
-    setTimeout(() => this.simulateRfqResponse(rfq), latency);
+    // Simulate independent MM latencies for both exchanges (200ms - 1000ms)
+    const buyLatency = 200 + Math.random() * 800;
+    const sellLatency = 200 + Math.random() * 800;
+
+    setTimeout(() => this.simulateRfqLegResponse(rfq.id, 'BUY'), buyLatency);
+    setTimeout(() => this.simulateRfqLegResponse(rfq.id, 'SELL'), sellLatency);
   }
 
-  private simulateRfqResponse(rfq: RfqState) {
-    const key = this.getNormalizedKey(rfq.contract);
-    const existing = this.activeRfqs.get(key);
-    if (!existing || existing.id !== rfq.id || existing.status !== 'PENDING') return;
+  private simulateRfqLegResponse(rfqId: string, leg: 'BUY' | 'SELL') {
+    // Find the specific DUAL-RFQ
+    let targetRfq: DualRfqState | undefined;
+    for (const rfq of this.activeDualRfqs.values()) {
+       if (rfq.id === rfqId) {
+          targetRfq = rfq;
+          break;
+       }
+    }
+    if (!targetRfq || !['PENDING', 'PARTIAL'].includes(targetRfq.status)) return;
 
-    existing.status = 'QUOTED';
-    
-    // Simulate MM giving a custom block quote. They absorb the taker fee but widen the spread.
-    // They offer a price that preserves ~50% of the original raw spread.
-    const customProfitPerUnit = rfq.originalSpread * 0.50;
-
-    // Check current opposing order book to see if the arb is still alive after the async latency
+    const key = this.getNormalizedKey(targetRfq.contract);
     const entries = this.prices.get(key);
     if (!entries) return;
 
@@ -626,40 +631,64 @@ export class ArbitrageEngine {
     const bybit = entries.find(e => e.exchange === "Bybit");
     if (!deribit || !bybit) return;
 
-    const useRoute1 = rfq.buyExchange === "Bybit";
-    const buyBook = useRoute1 ? bybit.asks : deribit.asks;
-    const sellBook = useRoute1 ? deribit.bids : bybit.bids;
-    
-    if (!buyBook || !sellBook || buyBook.length === 0 || sellBook.length === 0) return;
+    const useRoute1 = targetRfq.buyExchange === "Bybit";
 
-    // We received a block quote for the BUY leg, so we execute standard limit against the public SELL book.
-    let sPrice = sellBook[0][0];
-    if (useRoute1) sPrice = sPrice * deribit.underlyingPrice;
+    // Simulate MM giving a custom block quote.
+    // In dual RFQ, each MM takes roughly 25% of the raw spread edge, leaving 50% for us.
+    const customProfitPerLeg = targetRfq.originalSpread * 0.25;
 
-    // Derived MM quoted buy price based on current market condition
-    const quotedBuyPrice = sPrice - customProfitPerUnit;
+    if (leg === 'BUY') {
+      const buyBook = useRoute1 ? bybit.asks : deribit.asks;
+      if (!buyBook || buyBook.length === 0) return;
+      let bPrice = buyBook[0][0];
+      if (!useRoute1) bPrice = bPrice * deribit.underlyingPrice;
+      
+      // MM quotes us a slightly worse buy price than mid, but we pay 0 fees
+      targetRfq.buyQuote = bPrice + customProfitPerLeg;
+    } else {
+      const sellBook = useRoute1 ? deribit.bids : bybit.bids;
+      if (!sellBook || sellBook.length === 0) return;
+      let sPrice = sellBook[0][0];
+      if (useRoute1) sPrice = sPrice * deribit.underlyingPrice;
+      
+      // MM quotes us a slightly worse sell price than mid, but we pay 0 fees
+      targetRfq.sellQuote = sPrice - customProfitPerLeg;
+    }
 
-    // We pay 0 fees on the RFQ leg, but standard fees on the opposing public leg.
-    const standardFee = deribit.underlyingPrice * 0.0003;
-    const sellFee = Math.min(standardFee, sPrice * 0.125);
-    
-    const netProfitPerUnit = customProfitPerUnit - sellFee;
-    const vwapProfitPercent = (netProfitPerUnit / quotedBuyPrice) * 100;
+    targetRfq.status = (targetRfq.buyQuote && targetRfq.sellQuote) ? 'QUOTED' : 'PARTIAL';
+
+    if (targetRfq.status === 'QUOTED') {
+       this.evaluateDualQuotes(targetRfq);
+    }
+  }
+
+  private evaluateDualQuotes(rfq: DualRfqState) {
+    if (!rfq.buyQuote || !rfq.sellQuote) return;
+
+    // Both legs are purely RFQ block quotes, so standard taker fees are completely zeroed out!
+    const netProfitPerUnit = rfq.sellQuote - rfq.buyQuote;
+    const vwapProfitPercent = (netProfitPerUnit / rfq.buyQuote) * 100;
 
     if (vwapProfitPercent > this.minProfitThreshold) {
-       existing.status = 'EXECUTED';
+       rfq.status = 'EXECUTED';
        const netAbsoluteProfit = netProfitPerUnit * rfq.size;
+
+       const key = this.getNormalizedKey(rfq.contract);
+       const entries = this.prices.get(key)!;
+       const deribit = entries.find(e => e.exchange === "Deribit")!;
+       const bybit = entries.find(e => e.exchange === "Bybit")!;
+       const useRoute1 = rfq.buyExchange === "Bybit";
 
        const opportunity: Opportunity = {
          contract: rfq.contract,
          buyExchange: rfq.buyExchange,
-         buyPrice: quotedBuyPrice,
+         buyPrice: rfq.buyQuote,
          buyUnderlying: useRoute1 ? bybit.underlyingPrice : deribit.underlyingPrice,
-         buyIv: useRoute1 ? bybit.askIv : deribit.askIv,
+         buyIv: 0,
          sellExchange: rfq.sellExchange,
-         sellPrice: sPrice,
+         sellPrice: rfq.sellQuote,
          sellUnderlying: useRoute1 ? deribit.underlyingPrice : bybit.underlyingPrice,
-         sellIv: useRoute1 ? deribit.bidIv : bybit.bidIv,
+         sellIv: 0,
          profitPercent: vwapProfitPercent,
          ivSpread: 0,
          indexMismatch: 0,
@@ -673,10 +702,10 @@ export class ArbitrageEngine {
        this.attemptExecution(opportunity);
        
        const actualLatency = Date.now() - rfq.timestamp;
-       console.log(`[RFQ-EXEC] Block trade filled! ${rfq.contract.asset} | Profit: $${netAbsoluteProfit.toFixed(2)} | Latency: ${actualLatency}ms`);
+       console.log(`[DUAL-RFQ-EXEC] Zero-fee double block trade filled! ${rfq.contract.asset} | Profit: $${netAbsoluteProfit.toFixed(2)} | Max Latency: ${actualLatency}ms`);
     } else {
-       existing.status = 'EXPIRED';
-       console.log(`[RFQ-REJECT] Quote no longer profitable after latency for ${rfq.contract.asset} (Net: ${vwapProfitPercent.toFixed(3)}%)`);
+       rfq.status = 'EXPIRED';
+       console.log(`[DUAL-RFQ-REJECT] Dual-quotes no longer cross profitably after latency for ${rfq.contract.asset} (Net: ${vwapProfitPercent.toFixed(3)}%)`);
     }
   }
 
