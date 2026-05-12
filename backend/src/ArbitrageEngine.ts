@@ -468,13 +468,18 @@ export class ArbitrageEngine {
     let buyIdx = 0;
     let sellIdx = 0;
     let layersConsumed = 0;
-    const TAKER_FEE = 0.0003; // 0.03%
+    const TAKER_FEE = 0.0003; // 0.03% of underlying
 
-    while (buyIdx < buyBook.length && sellIdx < sellBook.length && accumulatedSize < this.maxPositionSize) {
+    // Dynamic sizing based on USD cap
+    const maxCoinSize = deribit.underlyingPrice > 0 ? this.maxUsdPerTrade / deribit.underlyingPrice : this.maxPositionSize;
+    const effectiveMaxSize = Math.min(this.maxPositionSize, maxCoinSize);
+
+    let currentBSize = buyBook[0][1];
+    let currentSSize = sellBook[0][1];
+
+    while (buyIdx < buyBook.length && sellIdx < sellBook.length && accumulatedSize < effectiveMaxSize) {
       let bPrice = buyBook[buyIdx][0];
-      let bSize = buyBook[buyIdx][1];
       let sPrice = sellBook[sellIdx][0];
-      let sSize = sellBook[sellIdx][1];
 
       if (useRoute1) { // Buy Bybit, Sell Deribit
         sPrice = sPrice * deribit.underlyingPrice;
@@ -483,19 +488,36 @@ export class ArbitrageEngine {
       }
 
       const layerSpread = sPrice - bPrice;
-      const layerFees = (sPrice + bPrice) * TAKER_FEE;
+
+      // Fee calculations with 12.5% cap rule
+      // Standard fee is 0.03% of underlying, capped at 12.5% of the option price
+      const standardFee = deribit.underlyingPrice * TAKER_FEE;
+      const buyFee = Math.min(standardFee, bPrice * 0.125);
+      const sellFee = Math.min(standardFee, sPrice * 0.125);
+      const layerFees = buyFee + sellFee;
+      
       const layerNetProfit = layerSpread - layerFees;
 
       if (layerNetProfit <= 0) break; // This layer is not profitable after fees
 
-      const takeSize = Math.min(bSize, sSize, this.maxPositionSize - accumulatedSize);
+      const takeSize = Math.min(currentBSize, currentSSize, effectiveMaxSize - accumulatedSize);
       accumulatedSize += takeSize;
       accumulatedBuyCost += bPrice * takeSize;
       accumulatedSellValue += sPrice * takeSize;
       layersConsumed = Math.max(buyIdx, sellIdx) + 1;
 
-      if (takeSize === bSize) buyIdx++;
-      if (takeSize === sSize) sellIdx++;
+      currentBSize -= takeSize;
+      currentSSize -= takeSize;
+
+      // Advance indices if layer is exhausted
+      if (currentBSize <= 1e-8) {
+        buyIdx++;
+        if (buyIdx < buyBook.length) currentBSize = buyBook[buyIdx][1];
+      }
+      if (currentSSize <= 1e-8) {
+        sellIdx++;
+        if (sellIdx < sellBook.length) currentSSize = sellBook[sellIdx][1];
+      }
     }
 
     if (accumulatedSize <= 0) return;
