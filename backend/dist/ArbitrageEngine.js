@@ -264,11 +264,11 @@ export class ArbitrageEngine {
             priceData.timestamp = Date.now();
             this.prices.set(normalizedKey, entries);
             this.lastUpdate = Date.now();
+            // BUG FIX #1+#2: flat single check; also call monitorCloseOrders so
+            // resting limit fills are detected immediately on depth updates (not just tickers)
             if (priceData.asks.length > 0 && priceData.bids.length > 0) {
-                // Only check arb if we have depth data.
-                if (priceData.asks.length > 0 && priceData.bids.length > 0) {
-                    this.checkArbitrage(normalizedKey, contract, entries);
-                }
+                this.checkArbitrage(normalizedKey, contract, entries);
+                this.monitorCloseOrders(normalizedKey);
             }
         }
         catch (e) {
@@ -670,13 +670,15 @@ export class ArbitrageEngine {
             // MM quotes us a slightly worse sell price than mid, but we pay 0 fees
             targetRfq.sellQuote = sPrice - customProfitPerLeg;
         }
-        targetRfq.status = (targetRfq.buyQuote && targetRfq.sellQuote) ? 'QUOTED' : 'PARTIAL';
+        // BUG FIX #4: use !== undefined so zero-priced options don't break the state machine
+        targetRfq.status = (targetRfq.buyQuote !== undefined && targetRfq.sellQuote !== undefined) ? 'QUOTED' : 'PARTIAL';
         if (targetRfq.status === 'QUOTED') {
             this.evaluateDualQuotes(targetRfq);
         }
     }
     evaluateDualQuotes(rfq) {
-        if (!rfq.buyQuote || !rfq.sellQuote)
+        // BUG FIX #7: use !== undefined so zero-priced options work; safe null checks
+        if (rfq.buyQuote === undefined || rfq.sellQuote === undefined)
             return;
         // Both legs are purely RFQ block quotes, so standard taker fees are completely zeroed out!
         const netProfitPerUnit = rfq.sellQuote - rfq.buyQuote;
@@ -686,8 +688,12 @@ export class ArbitrageEngine {
             const netAbsoluteProfit = netProfitPerUnit * rfq.size;
             const key = this.getNormalizedKey(rfq.contract);
             const entries = this.prices.get(key);
+            if (!entries)
+                return;
             const deribit = entries.find(e => e.exchange === "Deribit");
             const bybit = entries.find(e => e.exchange === "Bybit");
+            if (!deribit || !bybit)
+                return;
             const useRoute1 = rfq.buyExchange === "Bybit";
             const opportunity = {
                 contract: rfq.contract,
@@ -902,7 +908,8 @@ export class ArbitrageEngine {
                 ask *= sellExData.underlyingPrice;
             attempt.rfqBuyQuote = ask * 1.005;
         }
-        attempt.rfqStatus = (attempt.rfqSellQuote && attempt.rfqBuyQuote) ? 'QUOTED' : 'PARTIAL';
+        // BUG FIX #3: use !== undefined so zero-priced options don't get stuck in PARTIAL
+        attempt.rfqStatus = (attempt.rfqSellQuote !== undefined && attempt.rfqBuyQuote !== undefined) ? 'QUOTED' : 'PARTIAL';
         if (attempt.rfqStatus === 'QUOTED' && attempt.rfqSellQuote && attempt.rfqBuyQuote) {
             if (attempt.rfqSellQuote >= attempt.minClosePrice && attempt.rfqBuyQuote <= attempt.maxClosePrice) {
                 this.finalizeClose(trade, attempt, 'RFQ', attempt.rfqSellQuote, attempt.rfqBuyQuote);
@@ -928,13 +935,27 @@ export class ArbitrageEngine {
         }
         const buyExData = trade.opportunity.buyExchange === 'Deribit' ? deribit : bybit;
         const sellExData = trade.opportunity.sellExchange === 'Deribit' ? deribit : bybit;
-        // Hit the market: take best bid to close long, lift best ask to close short
-        let closeLongPrice = buyExData.bids.length > 0 ? buyExData.bids[0][0] : trade.opportunity.buyPrice;
-        if (trade.opportunity.buyExchange === 'Deribit')
-            closeLongPrice *= buyExData.underlyingPrice;
-        let closeShortPrice = sellExData.asks.length > 0 ? sellExData.asks[0][0] : trade.opportunity.sellPrice;
-        if (trade.opportunity.sellExchange === 'Deribit')
-            closeShortPrice *= sellExData.underlyingPrice;
+        // BUG FIX #5: separate raw-price path from fallback to avoid double underlying conversion.
+        // Deribit raw prices are in BTC fraction → must multiply by underlyingPrice to get USD.
+        // trade.opportunity.buyPrice is ALREADY in USD → must NOT multiply again.
+        let closeLongPrice;
+        if (buyExData.bids.length > 0) {
+            closeLongPrice = buyExData.bids[0][0];
+            if (trade.opportunity.buyExchange === 'Deribit')
+                closeLongPrice *= buyExData.underlyingPrice;
+        }
+        else {
+            closeLongPrice = trade.opportunity.buyPrice; // already USD, no further conversion
+        }
+        let closeShortPrice;
+        if (sellExData.asks.length > 0) {
+            closeShortPrice = sellExData.asks[0][0];
+            if (trade.opportunity.sellExchange === 'Deribit')
+                closeShortPrice *= sellExData.underlyingPrice;
+        }
+        else {
+            closeShortPrice = trade.opportunity.sellPrice; // already USD, no further conversion
+        }
         console.log(`[MARKET-CLOSE] Timeout fallback for trade ${trade.id} | Long close: $${closeLongPrice.toFixed(2)} | Short close: $${closeShortPrice.toFixed(2)}`);
         this.finalizeClose(trade, attempt, 'MARKET', closeLongPrice, closeShortPrice);
     }
@@ -991,7 +1012,8 @@ export class ArbitrageEngine {
                 this.balances.Deribit += size + (netPnL / underlying);
             }
         }
-        const holdSec = ((Date.now() - trade.timestamp) / 1000).toFixed(1);
+        const holdMs = Date.now() - trade.timestamp;
+        const holdSec = (holdMs / 1000).toFixed(1);
         console.log(`[CLOSE-${method}] Trade ${trade.id} | Net P&L: $${netPnL.toFixed(2)} | Hold: ${holdSec}s | EntryGross: $${entryGross.toFixed(2)} | CloseGross: $${closeGross.toFixed(2)} | Fees: $${(entryFees + closeFees).toFixed(2)}`);
         this.broadcast({ type: 'TRADE_EXECUTED', data: trade });
         this.broadcast({
@@ -1000,10 +1022,32 @@ export class ArbitrageEngine {
                 tradeId: trade.id, closedBy: method, netPnL,
                 entryGross, closeGross,
                 entryFees, closeFees,
-                holdMs: Date.now() - trade.timestamp,
+                holdMs,
                 closeLongPrice, closeShortPrice
             }
         });
+        // BUG FIX #6: prune closed trades to prevent unbounded memory growth.
+        // Keep last 500 closed trades for UI history; drop the oldest beyond that.
+        setTimeout(() => {
+            const closedCount = this.trades.filter(t => t.status === 'CLOSED').length;
+            if (closedCount > 500) {
+                const firstClosedIdx = this.trades.findIndex(t => t.status === 'CLOSED');
+                if (firstClosedIdx !== -1) {
+                    const removed = this.trades.splice(firstClosedIdx, 1)[0];
+                    this.closeAttempts.delete(removed.id);
+                }
+            }
+            // Also evict stale RFQ entries (older than 60s)
+            const cutoff = Date.now() - 60_000;
+            for (const [k, v] of this.activeDualRfqs) {
+                if (v.timestamp < cutoff)
+                    this.activeDualRfqs.delete(k);
+            }
+            for (const [k, v] of this.activeSingleRfqs) {
+                if (v.timestamp < cutoff)
+                    this.activeSingleRfqs.delete(k);
+            }
+        }, 0);
     }
     broadcast(message) {
         const payload = JSON.stringify(message);
