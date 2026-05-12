@@ -472,7 +472,8 @@ export class ArbitrageEngine {
                 adjustedProfitPercent: vwapProfitPercent,
                 tradableSize: accumulatedSize,
                 potentialProfit: netAbsoluteProfit,
-                layersConsumed
+                layersConsumed,
+                executionType: 'ORDERBOOK'
             };
             this.broadcast({ type: "OPPORTUNITY", data: opportunity });
             this.attemptExecution(opportunity);
@@ -548,7 +549,8 @@ export class ArbitrageEngine {
                 adjustedProfitPercent: vwapProfitPercent,
                 tradableSize: rfq.size,
                 potentialProfit: netAbsoluteProfit,
-                layersConsumed: 0
+                layersConsumed: 0,
+                executionType: 'SINGLE_RFQ'
             };
             this.broadcast({ type: "OPPORTUNITY", data: opportunity });
             this.attemptExecution(opportunity);
@@ -664,7 +666,8 @@ export class ArbitrageEngine {
                 adjustedProfitPercent: vwapProfitPercent,
                 tradableSize: rfq.size,
                 potentialProfit: netAbsoluteProfit,
-                layersConsumed: 0 // Block trade bypasses orderbook layers
+                layersConsumed: 0,
+                executionType: 'DUAL_RFQ'
             };
             this.broadcast({ type: "OPPORTUNITY", data: opportunity });
             this.attemptExecution(opportunity);
