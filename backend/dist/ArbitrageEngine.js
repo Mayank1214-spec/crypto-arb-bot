@@ -806,7 +806,14 @@ export class ArbitrageEngine {
             const standardSellFee = sellExchangeData.underlyingPrice * 0.0003;
             const closeLongFee = Math.min(standardBuyFee, closeLongPrice * 0.125);
             const closeShortFee = Math.min(standardSellFee, closeShortPrice * 0.125);
-            const totalExitFees = (closeLongFee + closeShortFee) * trade.opportunity.tradableSize;
+            let totalExitFees = (closeLongFee + closeShortFee) * trade.opportunity.tradableSize;
+            // Adjust exit fees based on how the trade was executed (assume we exit the same way)
+            if (trade.opportunity.executionType === 'DUAL_RFQ') {
+                totalExitFees = 0; // Zero taker fees for dual block trades
+            }
+            else if (trade.opportunity.executionType === 'SINGLE_RFQ') {
+                totalExitFees = closeShortFee * trade.opportunity.tradableSize; // Only pay fee on the public leg
+            }
             const currentNetPnL = (trade.opportunity.sellPrice * trade.opportunity.tradableSize - trade.opportunity.buyPrice * trade.opportunity.tradableSize)
                 + (totalExitRev - totalExitCost)
                 - entryFees - totalExitFees;
