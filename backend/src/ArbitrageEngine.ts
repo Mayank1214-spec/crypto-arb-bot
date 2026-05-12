@@ -465,6 +465,7 @@ export class ArbitrageEngine {
     let accumulatedSize = 0;
     let accumulatedBuyCost = 0;
     let accumulatedSellValue = 0;
+    let accumulatedFees = 0;
     let buyIdx = 0;
     let sellIdx = 0;
     let layersConsumed = 0;
@@ -504,6 +505,7 @@ export class ArbitrageEngine {
       accumulatedSize += takeSize;
       accumulatedBuyCost += bPrice * takeSize;
       accumulatedSellValue += sPrice * takeSize;
+      accumulatedFees += layerFees * takeSize;
       layersConsumed = Math.max(buyIdx, sellIdx) + 1;
 
       currentBSize -= takeSize;
@@ -525,7 +527,7 @@ export class ArbitrageEngine {
     const vwapBuyPrice = accumulatedBuyCost / accumulatedSize;
     const vwapSellPrice = accumulatedSellValue / accumulatedSize;
     const vwapProfitPercent = ((vwapSellPrice - vwapBuyPrice) / vwapBuyPrice) * 100;
-    const netAbsoluteProfit = accumulatedSellValue - accumulatedBuyCost - ((accumulatedSellValue + accumulatedBuyCost) * TAKER_FEE);
+    const netAbsoluteProfit = accumulatedSellValue - accumulatedBuyCost - accumulatedFees;
 
     if (vwapProfitPercent > this.minProfitThreshold) {
       const opportunity: Opportunity = {
