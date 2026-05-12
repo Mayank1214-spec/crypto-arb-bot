@@ -39,6 +39,17 @@ interface DualRfqState {
   sellQuote?: number;
 }
 
+interface SingleRfqState {
+  id: string;
+  contract: OptionContract;
+  buyExchange: string;
+  sellExchange: string;
+  size: number;
+  timestamp: number;
+  status: 'PENDING' | 'QUOTED' | 'EXPIRED' | 'EXECUTED';
+  originalSpread: number;
+}
+
 interface TradeRecord {
   id: string;
   opportunity: Opportunity;
@@ -71,6 +82,7 @@ export class ArbitrageEngine {
   private bybitDebugCount = 0;
   private activeSymbols: string[] = [];
   private activeDualRfqs: Map<string, DualRfqState> = new Map();
+  private activeSingleRfqs: Map<string, SingleRfqState> = new Map();
 
   // Configuration
   private dryRun = process.env.DRY_RUN !== 'false'; // Default to true for safety
@@ -514,15 +526,21 @@ export class ArbitrageEngine {
       
       const layerNetProfit = layerSpread - layerFees;
 
-      if (layerNetProfit <= 0) {
-        // If the spread itself is profitable but killed by fees, trigger a DUAL-RFQ for the effective size
+      if (accumulatedSize === 0) {
+        // Evaluate raw spread for RFQ triggers on the first layer
         const rawProfitPercent = (layerSpread / bPrice) * 100;
         if (layerSpread > 0 && rawProfitPercent > this.minProfitThreshold) {
           const buyEx = useRoute1 ? "Bybit" : "Deribit";
           const sellEx = useRoute1 ? "Deribit" : "Bybit";
+          // Parallel Racing: Fire both Single-RFQ and Dual-RFQ.
+          // The first one to return a profitable execution locks the trade.
+          this.triggerSingleRfq(contract, buyEx, sellEx, effectiveMaxSize, layerSpread);
           this.triggerDualRfq(contract, buyEx, sellEx, effectiveMaxSize, layerSpread);
         }
-        break; // Still break standard VWAP execution
+      }
+
+      if (layerNetProfit <= 0) {
+        break; // Standard VWAP execution path fails here due to fees/spread
       }
 
       const takeSize = Math.min(currentBSize, currentSSize, effectiveMaxSize - accumulatedSize);
@@ -577,6 +595,95 @@ export class ArbitrageEngine {
       this.attemptExecution(opportunity);
       
       console.log(`[ARB-DEPTH] ${contract.asset} ${contract.strike}${contract.type[0]} | Profit: $${netAbsoluteProfit.toFixed(2)} (${vwapProfitPercent.toFixed(2)}%) | Size: ${accumulatedSize.toFixed(4)} | Layers: ${layersConsumed}`);
+    }
+  }
+
+  private triggerSingleRfq(contract: OptionContract, buyExchange: string, sellExchange: string, size: number, spread: number) {
+    const key = this.getNormalizedKey(contract);
+    if (this.activeSingleRfqs.has(key)) {
+       const existing = this.activeSingleRfqs.get(key)!;
+       if (existing.status === 'PENDING' || Date.now() - existing.timestamp < 10000) return;
+    }
+
+    if (size < 1.0) return;
+
+    const rfq: SingleRfqState = {
+      id: `SRFQ-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      contract,
+      buyExchange,
+      sellExchange,
+      size,
+      timestamp: Date.now(),
+      status: 'PENDING',
+      originalSpread: spread
+    };
+
+    this.activeSingleRfqs.set(key, rfq);
+    console.log(`[SINGLE-RFQ] Broadcasted block quote request on ${buyExchange} (Size: ${size.toFixed(2)})`);
+    
+    setTimeout(() => this.simulateSingleRfqResponse(rfq), 300 + Math.random() * 1000);
+  }
+
+  private simulateSingleRfqResponse(rfq: SingleRfqState) {
+    const key = this.getNormalizedKey(rfq.contract);
+    const existing = this.activeSingleRfqs.get(key);
+    if (!existing || existing.id !== rfq.id || existing.status !== 'PENDING') return;
+
+    existing.status = 'QUOTED';
+    
+    // MM takes ~50% of the raw spread edge, we get the rest, 0 taker fee on this leg.
+    const customProfitPerUnit = rfq.originalSpread * 0.50;
+
+    const entries = this.prices.get(key);
+    if (!entries) return;
+
+    const deribit = entries.find(e => e.exchange === "Deribit");
+    const bybit = entries.find(e => e.exchange === "Bybit");
+    if (!deribit || !bybit) return;
+
+    const useRoute1 = rfq.buyExchange === "Bybit";
+    const sellBook = useRoute1 ? deribit.bids : bybit.bids;
+    if (!sellBook || sellBook.length === 0) return;
+
+    let sPrice = sellBook[0][0];
+    if (useRoute1) sPrice = sPrice * deribit.underlyingPrice;
+
+    const quotedBuyPrice = sPrice - customProfitPerUnit;
+
+    const standardFee = deribit.underlyingPrice * 0.0003;
+    const sellFee = Math.min(standardFee, sPrice * 0.125);
+    
+    const netProfitPerUnit = customProfitPerUnit - sellFee;
+    const vwapProfitPercent = (netProfitPerUnit / quotedBuyPrice) * 100;
+
+    if (vwapProfitPercent > this.minProfitThreshold) {
+       existing.status = 'EXECUTED';
+       const netAbsoluteProfit = netProfitPerUnit * rfq.size;
+
+       const opportunity: Opportunity = {
+         contract: rfq.contract,
+         buyExchange: rfq.buyExchange,
+         buyPrice: quotedBuyPrice,
+         buyUnderlying: useRoute1 ? bybit.underlyingPrice : deribit.underlyingPrice,
+         buyIv: useRoute1 ? bybit.askIv : deribit.askIv,
+         sellExchange: rfq.sellExchange,
+         sellPrice: sPrice,
+         sellUnderlying: useRoute1 ? deribit.underlyingPrice : bybit.underlyingPrice,
+         sellIv: useRoute1 ? deribit.bidIv : bybit.bidIv,
+         profitPercent: vwapProfitPercent,
+         ivSpread: 0,
+         indexMismatch: 0,
+         adjustedProfitPercent: vwapProfitPercent,
+         tradableSize: rfq.size,
+         potentialProfit: netAbsoluteProfit,
+         layersConsumed: 0 
+       };
+
+       this.broadcast({ type: "OPPORTUNITY", data: opportunity });
+       this.attemptExecution(opportunity);
+       console.log(`[SINGLE-RFQ-EXEC] Block trade filled! ${rfq.contract.asset} | Profit: $${netAbsoluteProfit.toFixed(2)} | Latency: ${Date.now() - rfq.timestamp}ms`);
+    } else {
+       existing.status = 'EXPIRED';
     }
   }
 
