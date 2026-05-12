@@ -21,6 +21,7 @@ interface Opportunity {
   ivSpread: number;
   indexMismatch: number;
   adjustedProfitPercent: number;
+  tradableSize: number;
   potentialProfit: number;
   layersConsumed: number;
   executionType: 'ORDERBOOK' | 'SINGLE_RFQ' | 'DUAL_RFQ';
