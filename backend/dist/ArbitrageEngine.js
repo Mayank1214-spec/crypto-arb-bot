@@ -11,6 +11,7 @@ export class ArbitrageEngine {
     activeSymbols = [];
     activeDualRfqs = new Map();
     activeSingleRfqs = new Map();
+    closeAttempts = new Map(); // tradeId → CloseAttempt
     // Configuration
     dryRun = process.env.DRY_RUN !== 'false'; // Default to true for safety
     minProfitThreshold = 0.1; // 0.1% min profit to execute
@@ -320,7 +321,7 @@ export class ArbitrageEngine {
             priceData.timestamp = Date.now();
             this.prices.set(normalizedKey, entries);
             this.lastUpdate = Date.now();
-            this.monitorOpenTrades(normalizedKey, priceData);
+            this.monitorCloseOrders(normalizedKey);
         }
         catch (e) {
             console.error(`[updateTicker] Error processing ${exchange} data:`, e);
@@ -760,6 +761,7 @@ export class ArbitrageEngine {
         };
         this.trades.push(trade);
         this.broadcast({ type: "TRADE_EXECUTED", data: trade });
+        this.initiateClose(trade); // Immediately race all three close methods
         if (this.dryRun) {
             console.log(`[DRY RUN] Executed simulated trade for ${opportunity.contract.asset} @ ${opportunity.profitPercent.toFixed(2)}% profit`);
         }
@@ -767,79 +769,241 @@ export class ArbitrageEngine {
             // TODO: Place real orders
         }
     }
-    monitorOpenTrades(key, currentPrice) {
-        // key is asset_expiry_strike_type
-        // currentPrice is the latest data for one exchange
+    // ─────────────────────────────────────────────────────────────────────────────
+    // CLOSE SYSTEM — Three methods race simultaneously; first winner closes trade
+    // ─────────────────────────────────────────────────────────────────────────────
+    /**
+     * Called on every ticker/depth update. Checks if resting limit orders
+     * at targetClosePrice are now fillable on BOTH exchanges simultaneously.
+     * If yes → Method 2 (LIMIT) wins and closes the trade.
+     */
+    monitorCloseOrders(key) {
+        const entries = this.prices.get(key);
+        if (!entries)
+            return;
+        const deribit = entries.find(e => e.exchange === 'Deribit');
+        const bybit = entries.find(e => e.exchange === 'Bybit');
+        if (!deribit || !bybit)
+            return;
         for (const trade of this.trades) {
             if (trade.status !== 'OPEN')
                 continue;
-            const tradeKey = this.getNormalizedKey(trade.opportunity.contract);
-            if (tradeKey !== key)
+            if (this.getNormalizedKey(trade.opportunity.contract) !== key)
                 continue;
-            // We need prices from BOTH exchanges to calculate current PnL accurately
-            const entries = this.prices.get(key);
-            if (!entries || entries.length < 2)
+            const attempt = this.closeAttempts.get(trade.id);
+            if (!attempt || attempt.closed)
                 continue;
-            const deribit = entries.find(e => e.exchange === "Deribit");
-            const bybit = entries.find(e => e.exchange === "Bybit");
-            if (!deribit || !bybit)
-                continue;
-            // Calculate PnL (Simplified: current exit spread)
-            // If we bought Bybit and sold Deribit (useRoute1)
-            const buyExchangeData = trade.opportunity.buyExchange === "Deribit" ? deribit : bybit;
-            const sellExchangeData = trade.opportunity.sellExchange === "Deribit" ? deribit : bybit;
-            // To close LONG leg (we originally bought): we must SELL at the current BID
-            let closeLongPrice = buyExchangeData.bids && buyExchangeData.bids.length > 0 ? buyExchangeData.bids[0][0] : 0;
-            if (trade.opportunity.buyExchange === "Deribit")
-                closeLongPrice *= buyExchangeData.underlyingPrice;
-            // To close SHORT leg (we originally sold): we must BUY at the current ASK
-            let closeShortPrice = sellExchangeData.asks && sellExchangeData.asks.length > 0 ? sellExchangeData.asks[0][0] : 0;
-            if (trade.opportunity.sellExchange === "Deribit")
-                closeShortPrice *= sellExchangeData.underlyingPrice;
-            if (!closeLongPrice || !closeShortPrice)
-                continue;
-            // PnL Math
-            const entryFees = ((trade.opportunity.sellPrice - trade.opportunity.buyPrice) * trade.opportunity.tradableSize) - trade.opportunity.potentialProfit;
-            const totalExitCost = closeShortPrice * trade.opportunity.tradableSize;
-            const totalExitRev = closeLongPrice * trade.opportunity.tradableSize;
-            const standardBuyFee = buyExchangeData.underlyingPrice * 0.0003;
-            const standardSellFee = sellExchangeData.underlyingPrice * 0.0003;
-            const closeLongFee = Math.min(standardBuyFee, closeLongPrice * 0.125);
-            const closeShortFee = Math.min(standardSellFee, closeShortPrice * 0.125);
-            let totalExitFees = (closeLongFee + closeShortFee) * trade.opportunity.tradableSize;
-            // Adjust exit fees based on how the trade was executed (assume we exit the same way)
-            if (trade.opportunity.executionType === 'DUAL_RFQ') {
-                totalExitFees = 0; // Zero taker fees for dual block trades
-            }
-            else if (trade.opportunity.executionType === 'SINGLE_RFQ') {
-                totalExitFees = closeShortFee * trade.opportunity.tradableSize; // Only pay fee on the public leg
-            }
-            const currentNetPnL = (trade.opportunity.sellPrice * trade.opportunity.tradableSize - trade.opportunity.buyPrice * trade.opportunity.tradableSize)
-                + (totalExitRev - totalExitCost)
-                - entryFees - totalExitFees;
-            // Auto-close if we captured 80% of the predicted potential profit
-            if (currentNetPnL > (trade.opportunity.potentialProfit * 0.8)) {
-                this.closeTrade(trade, currentNetPnL);
+            const buyExData = trade.opportunity.buyExchange === 'Deribit' ? deribit : bybit;
+            const sellExData = trade.opportunity.sellExchange === 'Deribit' ? deribit : bybit;
+            // Close long leg: SELL on buy exchange → limit fill when bestBid >= targetClosePrice
+            let bestBid = buyExData.bids.length > 0 ? buyExData.bids[0][0] : 0;
+            if (trade.opportunity.buyExchange === 'Deribit')
+                bestBid *= buyExData.underlyingPrice;
+            // Close short leg: BUY on sell exchange → limit fill when bestAsk <= targetClosePrice
+            let bestAsk = sellExData.asks.length > 0 ? sellExData.asks[0][0] : 0;
+            if (trade.opportunity.sellExchange === 'Deribit')
+                bestAsk *= sellExData.underlyingPrice;
+            attempt.limitLongFillable = bestBid > 0 && bestBid >= attempt.targetClosePrice;
+            attempt.limitShortFillable = bestAsk > 0 && bestAsk <= attempt.targetClosePrice;
+            // Both legs fillable at target price simultaneously → limit close wins
+            if (attempt.limitLongFillable && attempt.limitShortFillable) {
+                this.finalizeClose(trade, attempt, 'LIMIT', attempt.targetClosePrice, attempt.targetClosePrice);
             }
         }
     }
-    closeTrade(trade, profit) {
-        console.log(`[EXECUTION] Closing trade ${trade.id} | Realized Profit: $${profit.toFixed(2)}`);
-        trade.status = 'CLOSED';
-        trade.profitActual = profit;
-        if (this.dryRun) {
-            // Credit back original simulation cost + profit
-            if (trade.opportunity.buyExchange === 'Bybit') {
-                this.balances.Bybit += (trade.opportunity.buyPrice * trade.opportunity.tradableSize) + profit;
+    /**
+     * Called immediately after a trade opens. Calculates the fee-adjusted
+     * symmetric close price and races all three close methods.
+     *
+     *  targetClosePrice = midpoint of [minClosePrice, maxClosePrice]
+     *  Since P cancels in the PnL math, any P in this window captures full entry spread.
+     *
+     *  Entry spread:  sellPrice - buyPrice  (locked)
+     *  Close contrib: closeLongPrice - closeShortPrice  (≈0 when both legs close at same P)
+     *  Net PnL:       entrySpread - entryFees - closeFees
+     */
+    initiateClose(trade) {
+        const { buyPrice, sellPrice, buyUnderlying, sellUnderlying, tradableSize, executionType } = trade.opportunity;
+        const underlying = buyUnderlying || sellUnderlying;
+        const midPrice = (buyPrice + sellPrice) / 2;
+        // Fee per leg at close (0 for DUAL_RFQ, reduced for SINGLE_RFQ)
+        let closeFeePerLeg = Math.min(underlying * 0.0003, midPrice * 0.125);
+        if (executionType === 'DUAL_RFQ')
+            closeFeePerLeg = 0;
+        if (executionType === 'SINGLE_RFQ')
+            closeFeePerLeg = Math.min(underlying * 0.0003, midPrice * 0.125) * 0.5;
+        const minClosePrice = buyPrice + closeFeePerLeg; // long leg profitable if sold >= here
+        const maxClosePrice = sellPrice - closeFeePerLeg; // short leg profitable if bought <= here
+        // If entry spread can't survive close fees → market close immediately
+        if (minClosePrice >= maxClosePrice) {
+            console.log(`[CLOSE-INIT] Spread too thin for limit/RFQ close → immediate market for trade ${trade.id}`);
+            const attempt = {
+                tradeId: trade.id, targetClosePrice: midPrice, minClosePrice, maxClosePrice,
+                rfqStatus: 'IDLE', limitLongFillable: false, limitShortFillable: false,
+                marketCloseAt: Date.now(), marketCloseScheduled: true, closed: false
+            };
+            this.closeAttempts.set(trade.id, attempt);
+            this.executeMarketClose(trade, attempt);
+            return;
+        }
+        const targetClosePrice = (minClosePrice + maxClosePrice) / 2;
+        const attempt = {
+            tradeId: trade.id, targetClosePrice, minClosePrice, maxClosePrice,
+            rfqStatus: 'IDLE', limitLongFillable: false, limitShortFillable: false,
+            marketCloseAt: Date.now() + 30_000, marketCloseScheduled: true, closed: false
+        };
+        this.closeAttempts.set(trade.id, attempt);
+        console.log(`[CLOSE-INIT] Trade ${trade.id} | Target: $${targetClosePrice.toFixed(2)} | Window: [$${minClosePrice.toFixed(2)}, $${maxClosePrice.toFixed(2)}] | Entry: ${executionType} | Market fallback: 30s`);
+        this.broadcast({
+            type: 'CLOSE_INITIATED',
+            data: { tradeId: trade.id, targetClosePrice, minClosePrice, maxClosePrice, executionType, marketFallbackAt: attempt.marketCloseAt }
+        });
+        // Method 1: RFQ close — zero taker fees, preferred
+        this.triggerRfqClose(trade, attempt);
+        // Method 2: Limit orders — monitored passively via monitorCloseOrders() on each tick
+        // Method 3: Market fallback — fires after 30s if neither above has closed
+        setTimeout(() => this.executeMarketClose(trade, attempt), 30_000);
+    }
+    /** Method 1: Broadcast reverse block quote to both exchanges to close both legs. */
+    triggerRfqClose(trade, attempt) {
+        if (attempt.closed || attempt.rfqStatus !== 'IDLE')
+            return;
+        attempt.rfqStatus = 'PENDING';
+        attempt.rfqCloseId = `RFC-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+        console.log(`[RFQ-CLOSE] Reverse block quote for trade ${trade.id} | Size: ${trade.opportunity.tradableSize.toFixed(4)} | Type: ${trade.opportunity.executionType}`);
+        // Simulate independent MM latencies for both close legs
+        setTimeout(() => this.simulateRfqCloseResponse(trade, attempt, 'LONG'), 200 + Math.random() * 800);
+        setTimeout(() => this.simulateRfqCloseResponse(trade, attempt, 'SHORT'), 200 + Math.random() * 800);
+    }
+    simulateRfqCloseResponse(trade, attempt, leg) {
+        if (attempt.closed || (attempt.rfqStatus !== 'PENDING' && attempt.rfqStatus !== 'PARTIAL'))
+            return;
+        const key = this.getNormalizedKey(trade.opportunity.contract);
+        const entries = this.prices.get(key);
+        if (!entries)
+            return;
+        const deribit = entries.find(e => e.exchange === 'Deribit');
+        const bybit = entries.find(e => e.exchange === 'Bybit');
+        if (!deribit || !bybit)
+            return;
+        const buyExData = trade.opportunity.buyExchange === 'Deribit' ? deribit : bybit;
+        const sellExData = trade.opportunity.sellExchange === 'Deribit' ? deribit : bybit;
+        if (leg === 'LONG') {
+            // Close long: sell on buy exchange. MM quotes ~99.5% of best bid (0 taker fee).
+            let bid = buyExData.bids.length > 0 ? buyExData.bids[0][0] : 0;
+            if (trade.opportunity.buyExchange === 'Deribit')
+                bid *= buyExData.underlyingPrice;
+            attempt.rfqSellQuote = bid * 0.995;
+        }
+        else {
+            // Close short: buy on sell exchange. MM charges ~100.5% of best ask (0 taker fee).
+            let ask = sellExData.asks.length > 0 ? sellExData.asks[0][0] : 0;
+            if (trade.opportunity.sellExchange === 'Deribit')
+                ask *= sellExData.underlyingPrice;
+            attempt.rfqBuyQuote = ask * 1.005;
+        }
+        attempt.rfqStatus = (attempt.rfqSellQuote && attempt.rfqBuyQuote) ? 'QUOTED' : 'PARTIAL';
+        if (attempt.rfqStatus === 'QUOTED' && attempt.rfqSellQuote && attempt.rfqBuyQuote) {
+            if (attempt.rfqSellQuote >= attempt.minClosePrice && attempt.rfqBuyQuote <= attempt.maxClosePrice) {
+                this.finalizeClose(trade, attempt, 'RFQ', attempt.rfqSellQuote, attempt.rfqBuyQuote);
             }
             else {
-                // Approximate BTC/ETH profit
-                const asset = trade.opportunity.contract.asset;
-                const underlyingPrice = trade.opportunity.buyUnderlying;
-                this.balances.Deribit += trade.opportunity.tradableSize + (profit / underlyingPrice);
+                attempt.rfqStatus = 'EXPIRED';
+                console.log(`[RFQ-CLOSE-REJECT] Quotes outside profitable window for trade ${trade.id} | Sell: $${attempt.rfqSellQuote.toFixed(2)} | Buy: $${attempt.rfqBuyQuote.toFixed(2)}`);
             }
         }
-        this.broadcast({ type: "TRADE_EXECUTED", data: trade }); // Update status in Flutter
+    }
+    /** Method 3: Market close — hits bid on long leg, lifts ask on short leg. Guaranteed fill. */
+    executeMarketClose(trade, attempt) {
+        if (attempt.closed)
+            return;
+        const key = this.getNormalizedKey(trade.opportunity.contract);
+        const entries = this.prices.get(key);
+        const deribit = entries?.find(e => e.exchange === 'Deribit');
+        const bybit = entries?.find(e => e.exchange === 'Bybit');
+        if (!deribit || !bybit) {
+            // No price data — close at entry prices as last resort
+            this.finalizeClose(trade, attempt, 'MARKET', trade.opportunity.buyPrice, trade.opportunity.sellPrice);
+            return;
+        }
+        const buyExData = trade.opportunity.buyExchange === 'Deribit' ? deribit : bybit;
+        const sellExData = trade.opportunity.sellExchange === 'Deribit' ? deribit : bybit;
+        // Hit the market: take best bid to close long, lift best ask to close short
+        let closeLongPrice = buyExData.bids.length > 0 ? buyExData.bids[0][0] : trade.opportunity.buyPrice;
+        if (trade.opportunity.buyExchange === 'Deribit')
+            closeLongPrice *= buyExData.underlyingPrice;
+        let closeShortPrice = sellExData.asks.length > 0 ? sellExData.asks[0][0] : trade.opportunity.sellPrice;
+        if (trade.opportunity.sellExchange === 'Deribit')
+            closeShortPrice *= sellExData.underlyingPrice;
+        console.log(`[MARKET-CLOSE] Timeout fallback for trade ${trade.id} | Long close: $${closeLongPrice.toFixed(2)} | Short close: $${closeShortPrice.toFixed(2)}`);
+        this.finalizeClose(trade, attempt, 'MARKET', closeLongPrice, closeShortPrice);
+    }
+    /**
+     * Single settlement point for all close methods. The first method to call
+     * this wins; subsequent calls are no-ops (attempt.closed guard).
+     *
+     * Net PnL breakdown:
+     *   entryGross  = (entrySellPrice - entryBuyPrice) × size  ← locked at open
+     *   closeGross  = (closeLongPrice  - closeShortPrice) × size  ← ≈0 when P cancels
+     *   totalFees   = entryFees + closeFees
+     *   netPnL      = entryGross + closeGross - totalFees
+     */
+    finalizeClose(trade, attempt, method, closeLongPrice, // price received for selling the long leg
+    closeShortPrice // price paid for buying back the short leg
+    ) {
+        if (attempt.closed)
+            return; // Only one method can win
+        attempt.closed = true;
+        attempt.closedBy = method;
+        const { buyPrice, sellPrice, buyUnderlying, sellUnderlying, tradableSize, potentialProfit, executionType } = trade.opportunity;
+        const underlying = buyUnderlying || sellUnderlying;
+        const size = tradableSize;
+        // Entry gross spread (already locked)
+        const entryGross = (sellPrice - buyPrice) * size;
+        // Entry fees = what the VWAP engine subtracted from potentialProfit
+        const entryFees = entryGross - potentialProfit;
+        // Close contribution: P cancels when closeLongPrice === closeShortPrice
+        const closeGross = (closeLongPrice - closeShortPrice) * size;
+        // Close fees by method
+        let closeFees = 0;
+        if (method !== 'RFQ') {
+            const stdFee = underlying * 0.0003;
+            const longCloseFee = Math.min(stdFee, closeLongPrice * 0.125) * size;
+            const shortCloseFee = Math.min(stdFee, closeShortPrice * 0.125) * size;
+            if (executionType === 'DUAL_RFQ')
+                closeFees = 0;
+            else if (executionType === 'SINGLE_RFQ')
+                closeFees = shortCloseFee;
+            else
+                closeFees = longCloseFee + shortCloseFee;
+        }
+        // RFQ close → zero taker fees regardless of entry type
+        const netPnL = entryGross + closeGross - entryFees - closeFees;
+        trade.status = 'CLOSED';
+        trade.profitActual = netPnL;
+        // Return capital to simulation balances
+        if (this.dryRun) {
+            const costUsd = buyPrice * size;
+            if (trade.opportunity.buyExchange === 'Bybit') {
+                this.balances.Bybit += costUsd + netPnL;
+            }
+            else {
+                this.balances.Deribit += size + (netPnL / underlying);
+            }
+        }
+        const holdSec = ((Date.now() - trade.timestamp) / 1000).toFixed(1);
+        console.log(`[CLOSE-${method}] Trade ${trade.id} | Net P&L: $${netPnL.toFixed(2)} | Hold: ${holdSec}s | EntryGross: $${entryGross.toFixed(2)} | CloseGross: $${closeGross.toFixed(2)} | Fees: $${(entryFees + closeFees).toFixed(2)}`);
+        this.broadcast({ type: 'TRADE_EXECUTED', data: trade });
+        this.broadcast({
+            type: 'TRADE_CLOSED',
+            data: {
+                tradeId: trade.id, closedBy: method, netPnL,
+                entryGross, closeGross,
+                entryFees, closeFees,
+                holdMs: Date.now() - trade.timestamp,
+                closeLongPrice, closeShortPrice
+            }
+        });
     }
     broadcast(message) {
         const payload = JSON.stringify(message);
