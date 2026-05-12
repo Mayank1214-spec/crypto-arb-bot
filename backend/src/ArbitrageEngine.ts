@@ -26,6 +26,17 @@ interface Opportunity {
   layersConsumed: number;
 }
 
+interface RfqState {
+  id: string;
+  contract: OptionContract;
+  buyExchange: string;
+  sellExchange: string;
+  size: number;
+  timestamp: number;
+  status: 'PENDING' | 'QUOTED' | 'EXPIRED' | 'EXECUTED';
+  originalSpread: number;
+}
+
 interface TradeRecord {
   id: string;
   opportunity: Opportunity;
@@ -57,6 +68,7 @@ export class ArbitrageEngine {
   private matchedPairsCount = 0;
   private bybitDebugCount = 0;
   private activeSymbols: string[] = [];
+  private activeRfqs: Map<string, RfqState> = new Map();
 
   // Configuration
   private dryRun = process.env.DRY_RUN !== 'false'; // Default to true for safety
@@ -500,7 +512,16 @@ export class ArbitrageEngine {
       
       const layerNetProfit = layerSpread - layerFees;
 
-      if (layerNetProfit <= 0) break; // This layer is not profitable after fees
+      if (layerNetProfit <= 0) {
+        // If the spread itself is profitable but killed by fees, trigger an RFQ for the effective size
+        const rawProfitPercent = (layerSpread / bPrice) * 100;
+        if (layerSpread > 0 && rawProfitPercent > this.minProfitThreshold) {
+          const buyEx = useRoute1 ? "Bybit" : "Deribit";
+          const sellEx = useRoute1 ? "Deribit" : "Bybit";
+          this.triggerRfq(contract, buyEx, sellEx, effectiveMaxSize, layerSpread);
+        }
+        break; // Still break standard VWAP execution
+      }
 
       const takeSize = Math.min(currentBSize, currentSSize, effectiveMaxSize - accumulatedSize);
       accumulatedSize += takeSize;
@@ -554,6 +575,108 @@ export class ArbitrageEngine {
       this.attemptExecution(opportunity);
       
       console.log(`[ARB-DEPTH] ${contract.asset} ${contract.strike}${contract.type[0]} | Profit: $${netAbsoluteProfit.toFixed(2)} (${vwapProfitPercent.toFixed(2)}%) | Size: ${accumulatedSize.toFixed(4)} | Layers: ${layersConsumed}`);
+    }
+  }
+
+  private triggerRfq(contract: OptionContract, buyExchange: string, sellExchange: string, size: number, spread: number) {
+    const key = this.getNormalizedKey(contract);
+    if (this.activeRfqs.has(key)) {
+       const existing = this.activeRfqs.get(key)!;
+       if (existing.status === 'PENDING' || Date.now() - existing.timestamp < 10000) return; // 10s cooldown
+    }
+
+    // Block trades usually require high minimums, filter out tiny retail noise
+    if (size < 1.0) return;
+
+    const rfq: RfqState = {
+      id: `RFQ-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      contract,
+      buyExchange,
+      sellExchange,
+      size,
+      timestamp: Date.now(),
+      status: 'PENDING',
+      originalSpread: spread
+    };
+
+    this.activeRfqs.set(key, rfq);
+    console.log(`[RFQ] Broadcasted block quote request: ${contract.asset} ${contract.strike}${contract.type[0]} on ${buyExchange} (Size: ${size.toFixed(2)})`);
+    
+    // Simulate Market Maker pricing algo latency (300ms - 1500ms)
+    const latency = 300 + Math.random() * 1200;
+    setTimeout(() => this.simulateRfqResponse(rfq), latency);
+  }
+
+  private simulateRfqResponse(rfq: RfqState) {
+    const key = this.getNormalizedKey(rfq.contract);
+    const existing = this.activeRfqs.get(key);
+    if (!existing || existing.id !== rfq.id || existing.status !== 'PENDING') return;
+
+    existing.status = 'QUOTED';
+    
+    // Simulate MM giving a custom block quote. They absorb the taker fee but widen the spread.
+    // They offer a price that preserves ~50% of the original raw spread.
+    const customProfitPerUnit = rfq.originalSpread * 0.50;
+
+    // Check current opposing order book to see if the arb is still alive after the async latency
+    const entries = this.prices.get(key);
+    if (!entries) return;
+
+    const deribit = entries.find(e => e.exchange === "Deribit");
+    const bybit = entries.find(e => e.exchange === "Bybit");
+    if (!deribit || !bybit) return;
+
+    const useRoute1 = rfq.buyExchange === "Bybit";
+    const buyBook = useRoute1 ? bybit.asks : deribit.asks;
+    const sellBook = useRoute1 ? deribit.bids : bybit.bids;
+    
+    if (!buyBook || !sellBook || buyBook.length === 0 || sellBook.length === 0) return;
+
+    // We received a block quote for the BUY leg, so we execute standard limit against the public SELL book.
+    let sPrice = sellBook[0][0];
+    if (useRoute1) sPrice = sPrice * deribit.underlyingPrice;
+
+    // Derived MM quoted buy price based on current market condition
+    const quotedBuyPrice = sPrice - customProfitPerUnit;
+
+    // We pay 0 fees on the RFQ leg, but standard fees on the opposing public leg.
+    const standardFee = deribit.underlyingPrice * 0.0003;
+    const sellFee = Math.min(standardFee, sPrice * 0.125);
+    
+    const netProfitPerUnit = customProfitPerUnit - sellFee;
+    const vwapProfitPercent = (netProfitPerUnit / quotedBuyPrice) * 100;
+
+    if (vwapProfitPercent > this.minProfitThreshold) {
+       existing.status = 'EXECUTED';
+       const netAbsoluteProfit = netProfitPerUnit * rfq.size;
+
+       const opportunity: Opportunity = {
+         contract: rfq.contract,
+         buyExchange: rfq.buyExchange,
+         buyPrice: quotedBuyPrice,
+         buyUnderlying: useRoute1 ? bybit.underlyingPrice : deribit.underlyingPrice,
+         buyIv: useRoute1 ? bybit.askIv : deribit.askIv,
+         sellExchange: rfq.sellExchange,
+         sellPrice: sPrice,
+         sellUnderlying: useRoute1 ? deribit.underlyingPrice : bybit.underlyingPrice,
+         sellIv: useRoute1 ? deribit.bidIv : bybit.bidIv,
+         profitPercent: vwapProfitPercent,
+         ivSpread: 0,
+         indexMismatch: 0,
+         adjustedProfitPercent: vwapProfitPercent,
+         tradableSize: rfq.size,
+         potentialProfit: netAbsoluteProfit,
+         layersConsumed: 0 // Block trade bypasses orderbook layers
+       };
+
+       this.broadcast({ type: "OPPORTUNITY", data: opportunity });
+       this.attemptExecution(opportunity);
+       
+       const actualLatency = Date.now() - rfq.timestamp;
+       console.log(`[RFQ-EXEC] Block trade filled! ${rfq.contract.asset} | Profit: $${netAbsoluteProfit.toFixed(2)} | Latency: ${actualLatency}ms`);
+    } else {
+       existing.status = 'EXPIRED';
+       console.log(`[RFQ-REJECT] Quote no longer profitable after latency for ${rfq.contract.asset} (Net: ${vwapProfitPercent.toFixed(3)}%)`);
     }
   }
 
