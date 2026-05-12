@@ -602,7 +602,7 @@ export class ArbitrageEngine {
     const key = this.getNormalizedKey(contract);
     if (this.activeSingleRfqs.has(key)) {
        const existing = this.activeSingleRfqs.get(key)!;
-       if (existing.status === 'PENDING' || Date.now() - existing.timestamp < 10000) return;
+       if (Date.now() - existing.timestamp < 10000) return; // Strict 10s cooldown
     }
 
     if (size < 1.0) return;
@@ -691,7 +691,7 @@ export class ArbitrageEngine {
     const key = this.getNormalizedKey(contract);
     if (this.activeDualRfqs.has(key)) {
        const existing = this.activeDualRfqs.get(key)!;
-       if (['PENDING', 'PARTIAL'].includes(existing.status) || Date.now() - existing.timestamp < 10000) return; // 10s cooldown
+       if (Date.now() - existing.timestamp < 10000) return; // Strict 10s cooldown
     }
 
     // Block trades usually require high minimums, filter out tiny retail noise
