@@ -38,6 +38,12 @@ export class ArbitrageEngine {
             }
             // Log to console so you can see data health in server logs
             console.log(`[STATUS] Deribit=${deribitCount} symbols | Bybit=${bybitCount} symbols | Matched=${matchedPairs} pairs`);
+            const openTrades = this.trades.filter(t => t.status === 'OPEN').length;
+            const closedTrades = this.trades.filter(t => t.status === 'CLOSED').length;
+            const pendingCloses = Array.from(this.closeAttempts.values()).filter(a => !a.closed).length;
+            if (openTrades > 0 || closedTrades > 0) {
+                console.log(`[TRADES] Open: ${openTrades} | Closed: ${closedTrades} | Pending closes: ${pendingCloses}`);
+            }
             this.broadcast({
                 type: "STATUS",
                 data: {
@@ -48,7 +54,9 @@ export class ArbitrageEngine {
                     lastUpdate: this.lastUpdate,
                     exchanges: ["Deribit", "Bybit"],
                     deribitSymbols: deribitCount,
-                    bybitSymbols: bybitCount
+                    bybitSymbols: bybitCount,
+                    openTrades,
+                    closedTrades
                 }
             });
         }, 5000);
@@ -728,8 +736,10 @@ export class ArbitrageEngine {
         // Guard: prevent duplicate trades on the same contract, not the entire asset class
         const tradeKey = this.getNormalizedKey(opportunity.contract);
         const existing = this.trades.find(t => this.getNormalizedKey(t.opportunity.contract) === tradeKey && t.status === 'OPEN');
-        if (existing)
+        if (existing) {
+            console.log(`[GUARD] Skipping ${opportunity.contract.asset} ${opportunity.contract.strike}${opportunity.contract.type[0]} — already OPEN (trade ${existing.id})`);
             return;
+        }
         const costUsd = opportunity.buyPrice * opportunity.tradableSize;
         // Simple balance check for simulation
         // Deribit balance is in BTC — convert cost to BTC using underlying price
@@ -842,16 +852,17 @@ export class ArbitrageEngine {
             marketCloseAt: Date.now() + 30_000, marketCloseScheduled: true, closed: false
         };
         this.closeAttempts.set(trade.id, attempt);
-        console.log(`[CLOSE-INIT] Trade ${trade.id} | Target: $${targetClosePrice.toFixed(2)} | Entry: ${executionType} | Market fallback: 30s`);
+        console.log(`[CLOSE-INIT] Trade ${trade.id} | Target: $${targetClosePrice.toFixed(2)} | Entry: ${executionType} | Market fallback: 15s`);
         this.broadcast({
             type: 'CLOSE_INITIATED',
             data: { tradeId: trade.id, targetClosePrice, minClosePrice, maxClosePrice, executionType, marketFallbackAt: attempt.marketCloseAt }
         });
-        // Method 1: RFQ close — zero taker fees, preferred
-        this.triggerRfqClose(trade, attempt);
+        // Method 1: RFQ close — DISABLED for simulation (no real MM API).
+        // In production, uncomment: this.triggerRfqClose(trade, attempt);
+        // For now, rely on limit fills (Method 2) and market fallback (Method 3).
         // Method 2: Limit orders — monitored passively via monitorCloseOrders() on each tick
-        // Method 3: Market fallback — fires after 30s if neither above has closed
-        setTimeout(() => this.executeMarketClose(trade, attempt), 30_000);
+        // Method 3: Market fallback — fires after 15s to ensure trades stay visible
+        setTimeout(() => this.executeMarketClose(trade, attempt), 15_000);
     }
     /** Method 1: Broadcast reverse block quote to both exchanges to close both legs. */
     triggerRfqClose(trade, attempt) {
