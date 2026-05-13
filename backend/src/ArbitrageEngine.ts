@@ -978,41 +978,24 @@ export class ArbitrageEngine {
   /**
    * Called immediately after a trade opens. Calculates the fee-adjusted
    * symmetric close price and races all three close methods.
-   *
-   *  targetClosePrice = midpoint of [minClosePrice, maxClosePrice]
-   *  Since P cancels in the PnL math, any P in this window captures full entry spread.
-   *
-   *  Entry spread:  sellPrice - buyPrice  (locked)
-   *  Close contrib: closeLongPrice - closeShortPrice  (≈0 when both legs close at same P)
-   *  Net PnL:       entrySpread - entryFees - closeFees
    */
   private initiateClose(trade: TradeRecord) {
-    const { buyPrice, sellPrice, buyUnderlying, sellUnderlying, tradableSize, executionType } = trade.opportunity;
+    const { buyPrice, sellPrice, buyUnderlying, sellUnderlying, executionType } = trade.opportunity;
     const underlying = buyUnderlying || sellUnderlying;
     const midPrice   = (buyPrice + sellPrice) / 2;
 
-    // Fee per leg at close (0 for DUAL_RFQ, reduced for SINGLE_RFQ)
+    // Fee per leg at close (informational only — used by monitorCloseOrders limit window)
     let closeFeePerLeg = Math.min(underlying * 0.0003, midPrice * 0.125);
     if (executionType === 'DUAL_RFQ')   closeFeePerLeg = 0;
     if (executionType === 'SINGLE_RFQ') closeFeePerLeg = Math.min(underlying * 0.0003, midPrice * 0.125) * 0.5;
 
-    const minClosePrice = buyPrice  + closeFeePerLeg; // long leg profitable if sold >= here
-    const maxClosePrice = sellPrice - closeFeePerLeg; // short leg profitable if bought <= here
+    const minClosePrice = buyPrice  + closeFeePerLeg;
+    const maxClosePrice = sellPrice - closeFeePerLeg;
 
-    // If entry spread can't survive close fees → market close immediately
-    if (minClosePrice >= maxClosePrice) {
-      console.log(`[CLOSE-INIT] Spread too thin for limit/RFQ close → immediate market for trade ${trade.id}`);
-      const attempt: CloseAttempt = {
-        tradeId: trade.id, targetClosePrice: midPrice, minClosePrice, maxClosePrice,
-        rfqStatus: 'IDLE', limitLongFillable: false, limitShortFillable: false,
-        marketCloseAt: Date.now(), marketCloseScheduled: true, closed: false
-      };
-      this.closeAttempts.set(trade.id, attempt);
-      this.executeMarketClose(trade, attempt);
-      return;
-    }
+    // Always use simple midpoint as target. Profit is LOCKED AT ENTRY.
+    // Do NOT do an immediate market close even if fee window is inverted.
+    const targetClosePrice = midPrice;
 
-    const targetClosePrice = (minClosePrice + maxClosePrice) / 2;
     const attempt: CloseAttempt = {
       tradeId: trade.id, targetClosePrice, minClosePrice, maxClosePrice,
       rfqStatus: 'IDLE', limitLongFillable: false, limitShortFillable: false,
@@ -1020,7 +1003,7 @@ export class ArbitrageEngine {
     };
     this.closeAttempts.set(trade.id, attempt);
 
-    console.log(`[CLOSE-INIT] Trade ${trade.id} | Target: $${targetClosePrice.toFixed(2)} | Window: [$${minClosePrice.toFixed(2)}, $${maxClosePrice.toFixed(2)}] | Entry: ${executionType} | Market fallback: 30s`);
+    console.log(`[CLOSE-INIT] Trade ${trade.id} | Target: $${targetClosePrice.toFixed(2)} | Entry: ${executionType} | Market fallback: 30s`);
     this.broadcast({
       type: 'CLOSE_INITIATED',
       data: { tradeId: trade.id, targetClosePrice, minClosePrice, maxClosePrice, executionType, marketFallbackAt: attempt.marketCloseAt }
